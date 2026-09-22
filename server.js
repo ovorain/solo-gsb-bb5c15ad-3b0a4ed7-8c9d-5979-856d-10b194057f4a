@@ -7,6 +7,8 @@
  *  - /api/creep-compensation：书帖爬移补偿逐叶偏移（只读计算）
  *  - /api/annotations/locate：校样批注按原始面片身份定位到指定回放步（只读）
  *  - /api/plans* ：方案 JSON 持久化到 DATA_DIR（容器卷，含标签/备注/校样批注）
+ *  - 版本差异审阅：每次成功保存写入不可变快照（DATA_DIR/<id>.versions/），
+ *    GET /api/plans/:id/versions、/versions/:version、/diff（只读）
  */
 const express = require('express');
 const fs = require('fs');
@@ -248,6 +250,86 @@ app.post('/api/annotations/locate', (req, res) => {
 function planFile(id) { return path.join(DATA_DIR, `${id}.json`); }
 
 /**
+ * ---------- 不可变版本快照 ----------
+ * 每次成功保存方案后，把本次规范化方案完整写入
+ *   DATA_DIR/<id>.versions/v000006.json（6 位零填序号，从 1 起）。
+ * 快照只追加、永不原地改写：恢复历史版本也只是把它载入为当前草稿，
+ * 下一次保存产生新序号，历史保持完整。
+ */
+function versionsDir(id) { return path.join(DATA_DIR, `${id}.versions`); }
+function versionFile(id, version) {
+  return path.join(versionsDir(id), `v${String(version).padStart(6, '0')}.json`);
+}
+const VERSION_FILE_RE = /^v(\d{6})\.json$/;
+
+/** 读取某方案全部版本（序号升序）；损坏快照跳过。 */
+function readVersions(id) {
+  const dir = versionsDir(id);
+  if (!fs.existsSync(dir)) return [];
+  const out = [];
+  for (const f of fs.readdirSync(dir)) {
+    const m = VERSION_FILE_RE.exec(f);
+    if (!m) continue;
+    try {
+      const snap = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'));
+      out.push(snapshotSummary(snap, Number(m[1])));
+    } catch { /* 损坏快照跳过，不影响其它版本 */ }
+  }
+  out.sort((a, b) => a.version - b.version);
+  return out;
+}
+
+/** 版本摘要（列表用）：不返回完整 labels/steps/annotations。 */
+function snapshotSummary(snap, version) {
+  const p = snap.plan || {};
+  const annos = Array.isArray(p.annotations) ? p.annotations : [];
+  return {
+    version,
+    planId: snap.planId,
+    name: p.name || '未命名方案',
+    rows: p.rows, cols: p.cols,
+    steps: Array.isArray(p.steps) ? p.steps.length : 0,
+    tags: Array.isArray(p.tags) ? p.tags : [],
+    note: typeof p.note === 'string' ? p.note : '',
+    annotations: annos.length,
+    openAnnotations: annos.reduce((n, a) => n + (a && a.resolved !== true ? 1 : 0), 0),
+    hasCreep: !!p.creepCompensation,
+    savedAt: typeof snap.savedAt === 'string' ? snap.savedAt : null,
+    reason: snap.reason === 'restore' ? 'restore' : 'save',
+    restoredFromVersion: Number.isInteger(snap.restoredFromVersion) ? snap.restoredFromVersion : null
+  };
+}
+
+/** 追加不可变快照：按目录中最大序号 + 1 原子写入，返回版本号与摘要。 */
+function appendVersionSnapshot(id, plan, reason, fromVersion) {
+  const dir = versionsDir(id);
+  fs.mkdirSync(dir, { recursive: true });
+  const nextVersion = readVersions(id).reduce((m, v) => Math.max(m, v.version), 0) + 1;
+  const now = new Date().toISOString();
+  const snap = {
+    version: nextVersion,
+    planId: id,
+    reason: reason === 'restore' ? 'restore' : 'save',
+    savedAt: now,
+    plan
+  };
+  if (reason === 'restore' && Number.isInteger(fromVersion) && fromVersion > 0) {
+    snap.restoredFromVersion = fromVersion;
+  }
+  const tmp = path.join(dir, `.v${String(nextVersion).padStart(6, '0')}.json.tmp-${process.pid}-${Date.now()}`);
+  fs.writeFileSync(tmp, JSON.stringify(snap, null, 2));
+  fs.renameSync(tmp, versionFile(id, nextVersion));
+  return { version: nextVersion, savedAt: now };
+}
+
+/** 读取单个版本快照（不存在返回 null）。 */
+function readVersionSnapshot(id, version) {
+  const f = versionFile(id, version);
+  if (!fs.existsSync(f)) return null;
+  return JSON.parse(fs.readFileSync(f, 'utf8'));
+}
+
+/**
  * 方案元信息严格校验：直接委托浏览器/服务端共用的 E.normalizePlanMeta，
  * 错误带 code（bad_name/name_too_long/bad_tags/tag_too_long/tag_forbidden/
  * too_many_tags/bad_note/note_too_long），由 POST 处理器整请求拒绝。
@@ -332,6 +414,8 @@ function readAllPlans() {
           note: typeof p.note === 'string' ? p.note : '',
           annotations: annos.length,
           openAnnotations: annos.reduce((n, a) => n + (a && a.resolved !== true ? 1 : 0), 0),
+          versions: fs.existsSync(path.join(DATA_DIR, `${id}.versions`))
+            ? readVersions(id).length : 0,
           createdAt: typeof p.createdAt === 'string' ? p.createdAt : updatedAt,
           updatedAt
         };
@@ -440,7 +524,14 @@ app.post('/api/plans', (req, res) => {
   const tmp = path.join(DATA_DIR, `.${id}.json.tmp-${process.pid}-${Date.now()}`);
   fs.writeFileSync(tmp, JSON.stringify(body, null, 2));
   fs.renameSync(tmp, existingPath);
-  res.json({ ok: true, id, plan: body });
+
+  // 本次保存成功 → 追加不可变版本快照（只追加，永不原地改写；恢复历史后保存另起新版本）
+  const restoreFrom = Number.isInteger(req.body && req.body.restoredFromVersion)
+    ? req.body.restoredFromVersion : null;
+  const { version, savedAt } = appendVersionSnapshot(
+    id, body, restoreFrom ? 'restore' : 'save', restoreFrom);
+
+  res.json({ ok: true, id, version, savedAt, plan: body });
 });
 
 app.get('/api/plans/:id', (req, res) => {
@@ -456,7 +547,110 @@ app.delete('/api/plans/:id', (req, res) => {
   if (!/^[a-zA-Z0-9_-]{1,64}$/.test(id)) return res.status(400).json({ ok: false, error: { message: '非法 id' } });
   const f = planFile(id);
   if (fs.existsSync(f)) fs.unlinkSync(f);
+  // 一并删除不可变版本目录（删方案即删全部历史，与命名卷内文件清理一致）
+  fs.rmSync(versionsDir(id), { recursive: true, force: true });
   res.json({ ok: true });
+});
+
+// ---------- 版本差异审阅（只读） ----------
+/**
+ * GET /api/plans/:id/versions：不可变版本列表（序号升序）。
+ * 响应 { ok, id, latest, versions:[{version,name,rows,cols,steps,tags,note,
+ *   annotations,openAnnotations,hasCreep,savedAt,reason,restoredFromVersion}] }。
+ */
+app.get('/api/plans/:id/versions', (req, res) => {
+  const { id } = req.params;
+  if (!/^[a-zA-Z0-9_-]{1,64}$/.test(id)) {
+    return res.status(400).json({ ok: false, error: { code: 'bad_id', message: '非法 id' } });
+  }
+  if (!fs.existsSync(planFile(id))) {
+    return res.status(404).json({ ok: false, error: { code: 'not_found', message: '方案不存在' } });
+  }
+  const versions = readVersions(id);
+  res.json({ ok: true, id, latest: versions.length ? versions[versions.length - 1].version : 0, versions });
+});
+
+/**
+ * GET /api/plans/:id/versions/:version：单个不可变版本的完整快照。
+ * 返回 { ok, version, reason, restoredFromVersion, savedAt, plan }。
+ */
+app.get('/api/plans/:id/versions/:version', (req, res) => {
+  const { id } = req.params;
+  if (!/^[a-zA-Z0-9_-]{1,64}$/.test(id)) {
+    return res.status(400).json({ ok: false, error: { code: 'bad_id', message: '非法 id' } });
+  }
+  const v = Number(req.params.version);
+  if (!Number.isInteger(v) || v < 1) {
+    return res.status(400).json({ ok: false, error: { code: 'bad_version', message: '版本号须为不小于 1 的整数。' } });
+  }
+  if (!fs.existsSync(planFile(id))) {
+    return res.status(404).json({ ok: false, error: { code: 'not_found', message: '方案不存在' } });
+  }
+  const snap = readVersionSnapshot(id, v);
+  if (!snap) {
+    return res.status(404).json({ ok: false, error: { code: 'version_not_found', message: `版本 v${v} 不存在。` } });
+  }
+  res.json({
+    ok: true,
+    version: snap.version,
+    reason: snap.reason === 'restore' ? 'restore' : 'save',
+    restoredFromVersion: Number.isInteger(snap.restoredFromVersion) ? snap.restoredFromVersion : null,
+    savedAt: snap.savedAt,
+    plan: snap.plan
+  });
+});
+
+/**
+ * GET /api/plans/:id/diff?from=&to=：以原始纸格与步骤序号为稳定身份
+ * 比较两个不可变版本（页码 / 折叠步骤 / 标签备注 / 校样批注 / 爬移补偿的增删改）。
+ * 响应包裹引擎 diffPlans：{ ok, id, from:{version,savedAt}, to:{...}, diff }。
+ */
+app.get('/api/plans/:id/diff', (req, res) => {
+  const { id } = req.params;
+  if (!/^[a-zA-Z0-9_-]{1,64}$/.test(id)) {
+    return res.status(400).json({ ok: false, error: { code: 'bad_id', message: '非法 id' } });
+  }
+  if (!fs.existsSync(planFile(id))) {
+    return res.status(404).json({ ok: false, error: { code: 'not_found', message: '方案不存在' } });
+  }
+  const fromV = Number(req.query.from);
+  const toV = Number(req.query.to);
+  if (!Number.isInteger(fromV) || fromV < 1 || !Number.isInteger(toV) || toV < 1) {
+    return res.status(400).json({
+      ok: false,
+      error: { code: 'bad_version', message: 'from / to 均须为不小于 1 的版本号整数。' }
+    });
+  }
+  if (fromV === toV) {
+    return res.status(400).json({
+      ok: false,
+      error: { code: 'bad_version', message: '请选择两个不同的版本进行比较（from ≠ to）。' }
+    });
+  }
+  const snapF = readVersionSnapshot(id, fromV);
+  const snapT = readVersionSnapshot(id, toV);
+  if (!snapF || !snapT) {
+    return res.status(404).json({
+      ok: false,
+      error: {
+        code: 'version_not_found',
+        message: `版本 v${!snapF ? fromV : toV} 不存在。`
+      }
+    });
+  }
+  let diff;
+  try {
+    diff = E.diffPlans(snapF.plan, snapT.plan);
+  } catch (e) {
+    return res.status(400).json({ ok: false, error: { code: 'bad_snapshot', message: e.message } });
+  }
+  res.json({
+    ok: true,
+    id,
+    from: { version: snapF.version, savedAt: snapF.savedAt },
+    to: { version: snapT.version, savedAt: snapT.savedAt },
+    diff
+  });
 });
 
 if (require.main === module) {

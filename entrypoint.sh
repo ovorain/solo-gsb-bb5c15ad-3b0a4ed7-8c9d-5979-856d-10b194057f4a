@@ -24,7 +24,12 @@ const annos = E.normalizeAnnotations(
 if (annos.length !== 1 || annos[0].text !== '批注自检') throw new Error('批注规范化自检失败');
 const loc = E.locateAnnotations(1, 2, {}, grid.steps, 1, annos);
 if (!loc.ok || loc.points[0].at !== '1,0') throw new Error('批注身份定位自检失败');
-console.log('[fold-proofing] 折叠引擎、标签与批注规范化自检通过');
+// 版本差异自检：原始纸格 + 步骤序号为稳定身份，页码增改 / 步骤新增应被检出
+const v1 = { name: '差异自检', rows: 1, cols: 2, labels: { '0,0': { front: '1', back: '' } }, steps: [] };
+const v2 = { name: '差异自检', rows: 1, cols: 2, labels: { '0,0': { front: '1', back: '2' }, '1,0': { front: '3', back: '' } }, steps: [{ axis: 'v', line: 1, dir: 'r' }] };
+const d = E.diffPlans(v1, v2);
+if (!d.ok || d.summary.total < 3 || !d.affectedCells.includes('1,0')) throw new Error('版本差异计算自检失败');
+console.log('[fold-proofing] 折叠引擎、标签、批注规范化与版本差异自检通过');
 "
 
 echo "[fold-proofing] 启动 Web 服务，端口 ${PORT:-3000} ..."

@@ -653,6 +653,90 @@ button.fold { flex: 1 1 40%; min-width: 110px; font-weight: 600; }
 }
 .face-anno-count.open { background: var(--anno-error-bg); color: var(--anno-error); }
 
+/* ---------- 版本差异审阅 ---------- */
+:root {
+  --diff-edge: #7c3aed;
+  --diff-edge-bg: #f3eefe;
+  --diff-focus: #5b21b6;
+}
+.diff-summary {
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 1.6;
+  background: #f4f7fc;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 7px 9px;
+}
+.diff-list {
+  list-style: none; margin: 8px 0 0; padding: 0;
+  display: flex; flex-direction: column; gap: 5px;
+  max-height: 420px; overflow-y: auto;
+}
+.diff-item {
+  border: 1px solid var(--line);
+  border-left-width: 4px;
+  border-radius: 6px;
+  padding: 5px 9px;
+  font-size: 12px;
+  line-height: 1.55;
+  background: #fff;
+}
+.diff-item.op-add { border-left-color: var(--ok); background: #f5fcf8; }
+.diff-item.op-remove { border-left-color: var(--danger); background: #fff8f7; }
+.diff-item.op-change { border-left-color: var(--diff-edge); background: var(--diff-edge-bg); }
+.diff-item.diff-focus {
+  box-shadow: 0 0 0 2px rgba(124, 58, 237, .35);
+}
+.diff-kind {
+  display: inline-block; font-size: 10px; font-weight: 700;
+  border-radius: 10px; padding: 0 7px; margin-right: 5px;
+  background: #eef1f5; color: var(--muted);
+}
+.diff-kind.k-step { background: #e3ecfd; color: var(--primary); }
+.diff-kind.k-label { background: #fdf0dc; color: #a16207; }
+.diff-kind.k-annotation { background: var(--anno-info-bg); color: var(--anno-info); }
+.diff-kind.k-meta { background: #eef1f5; color: var(--muted); }
+.diff-kind.k-grid { background: #f3e8ff; color: var(--diff-focus); }
+.diff-kind.k-creep { background: #e0f2fe; color: #0369a1; }
+.diff-op { font-weight: 700; margin-right: 5px; font-variant-numeric: tabular-nums; }
+.diff-op.op-add { color: var(--ok); }
+.diff-op.op-remove { color: var(--danger); }
+.diff-op.op-change { color: var(--diff-focus); }
+.diff-main { color: var(--ink); overflow-wrap: anywhere; }
+.diff-detail { color: var(--muted); font-size: 11px; margin-top: 2px; }
+.diff-old-new { display: flex; flex-direction: column; gap: 1px; margin-top: 3px; font-size: 11px; }
+.diff-old { color: var(--danger); overflow-wrap: anywhere; }
+.diff-new { color: var(--ok); overflow-wrap: anywhere; }
+.diff-actions { display: flex; gap: 6px; margin-top: 5px; flex-wrap: wrap; }
+.diff-actions button { padding: 2px 9px; font-size: 11px; }
+.diff-empty { list-style: none; color: var(--muted); font-size: 12px; padding: 4px 0; }
+
+/* 审阅模式横幅 */
+.review-banner {
+  margin: 6px 0 8px;
+  background: #f3e8ff;
+  border: 1px solid #c9b0f2;
+  color: var(--diff-focus);
+  border-radius: 8px;
+  padding: 8px 10px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.review-banner-text { font-size: 12px; line-height: 1.6; }
+.review-banner .row { margin: 0; }
+
+/* 画布：差异受影响纸格高亮（紫色脉冲描边；当前差异聚焦格实色加重） */
+@keyframes diff-pulse {
+  0%, 100% { box-shadow: none; }
+}
+.swatch.diff { background: var(--diff-edge-bg); border-color: var(--diff-edge); }
+
+/* 步骤列表中差异步骤 */
+.step-list li.diff-step { color: var(--diff-focus); font-weight: 700; }
+.step-list li.diff-step::after { content: ' 改'; font-size: 10px; color: var(--diff-edge); }
+.step-list li.diff-add::after { content: ' 增'; font-size: 10px; color: var(--ok); }
+.step-list li.diff-remove::after { content: ' 删'; font-size: 10px; color: var(--danger); }
+
 /* ---------- 打印样式：隐藏全部编辑控件，两张印版各占一页 ---------- */
 @media print {
   @page { size: A4 landscape; margin: 8mm; }

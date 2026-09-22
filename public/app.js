@@ -26,7 +26,16 @@ const app = {
   audit: { result: null },                  // 生产质量审计（只读，随方案变化自动重算）
   creep: { eligible: null, result: null },  // 书帖爬移补偿（实时重算，应用后写入独立字段）
   annotation: { editing: null, selectedId: null },  // 校样批注弹层 / 画布定位高亮
-  listFilter: { tags: '', q: '', since: '' }   // 存档列表当前筛选条件
+  listFilter: { tags: '', q: '', since: '' },   // 存档列表当前筛选条件
+  // 版本差异审阅
+  versions: {
+    planId: null,            // 当前草稿所属存档 id
+    list: null,              // 版本摘要数组（序号升序）
+    diff: null,              // 当前比较结果 { fromV, toV, envelope, diff }
+    review: null,             // 历史版本只读审阅：{ version, savedAt, reason, restoredFromVersion, stash }
+    restoreMarker: null       // 恢复历史后首次保存携带的来源版本号（服务端快照标记 reason=restore）
+  },
+  diffFocus: { cells: [], step: null, annoId: null }  // 当前点击差异的聚焦信息
 };
 
 const $ = (id) => document.getElementById(id);
@@ -131,6 +140,21 @@ function init() {
   canvas.addEventListener('click', onCanvasClick);
   canvas.addEventListener('mousemove', onCanvasMove);
   canvas.addEventListener('mouseleave', () => { app.hoverHandle = null; draw(); });
+
+  // 版本差异审阅
+  $('diffBtn').addEventListener('click', compareVersions);
+  $('reviewVersionsBtn').addEventListener('click', () => {
+    fillVersionSelectors(app.versions.list);
+    $('versionStatus').textContent = `共 ${app.versions.list.length} 个不可变版本（按版本号升序）。`;
+  });
+  $('reviewExitBtn').addEventListener('click', exitReview);
+  $('reviewRestoreBtn').addEventListener('click', restoreReviewedVersion);
+  const syncDiffBtn = () => {
+    $('diffBtn').disabled = !$('diffFrom').value || !$('diffTo').value
+      || $('diffFrom').value === $('diffTo').value;
+  };
+  $('diffFrom').addEventListener('change', syncDiffBtn);
+  $('diffTo').addEventListener('change', syncDiffBtn);
   $('planName').addEventListener('input', (e) => { app.plan.name = e.target.value; });
   $('planNote').addEventListener('input', (e) => { app.plan.note = e.target.value; });
 
@@ -140,6 +164,7 @@ function init() {
 
 // ---------- 网格 / 方案 ----------
 function createGrid() {
+  if (reviewGuard('新建网格会清空当前内容。')) return;
   const rows = clampInt($('rowsInput').value, 1, 12, 2);
   const cols = clampInt($('colsInput').value, 1, 12, 2);
   app.plan = {
@@ -152,6 +177,9 @@ function createGrid() {
   $('planNote').value = '';
   renderTagChips();
   app.loadedId = null;
+  resetVersionState();
+  fillVersionSelectors([]);
+  renderVersionCard();
   setUpto(0, true);
   refreshLineSelect();
 }
@@ -204,6 +232,7 @@ function addStepFromForm(dir) {
  * 若当前不在最新步，则先把回放推进到最新再校验（步骤只追加在末尾）。
  */
 function requestStep(step) {
+  if (reviewGuard()) return;
   // 校验基于“已应用此前所有步骤”的状态
   const base = E.replay(app.plan.rows, app.plan.cols, app.plan.labels, app.plan.steps).state;
   const err = E.validateFold(base, step);
@@ -229,6 +258,7 @@ function flashConflict(err) {
 }
 
 function truncateSteps() {
+  if (reviewGuard()) return;
   app.plan.steps = app.plan.steps.slice(0, app.upto);
   setUpto(app.plan.steps.length, true);
 }
@@ -277,6 +307,8 @@ function render() {
   renderAudit();
   renderCreep();
   renderAnnotations();
+  applyReviewLock();
+  renderVersionCard();
 }
 
 function renderControls() {
@@ -287,11 +319,14 @@ function renderControls() {
   $('stepLabel').textContent = `第 ${app.upto} / ${max} 步`;
   $('delStepBtn').disabled = app.upto === 0;
   $('clearStepsBtn').disabled = max === 0;
+  $('saveBtn').disabled = !app.plan.rows;
   $('prevBtn').disabled = app.upto === 0;
   $('nextBtn').disabled = app.upto >= max;
-  $('canvasHint').textContent = app.plan.rows
-    ? '点击纸格编辑正反面页码；点击网格边缘箭头添加折叠。红色虚线手柄表示该折非法。'
-    : '先在左侧创建行列纸格。';
+  $('canvasHint').textContent = !app.plan.rows
+    ? '先在左侧创建行列纸格。'
+    : app.versions.review
+      ? `只读审阅 v${app.versions.review.version}：可逐步回放；紫色描边为差异受影响纸格，点击纸格可定位对应差异。`
+      : '点击纸格编辑正反面页码；点击网格边缘箭头添加折叠。红色虚线手柄表示该折非法。';
 
   const badge = $('statusBadge');
   if (app.replay && app.replay.error) {
@@ -302,6 +337,9 @@ function renderControls() {
     if (info.folded) { badge.className = 'badge ok'; badge.textContent = '已收成单叠'; }
     else { badge.className = 'badge idle'; badge.textContent = `${info.stacks.length} 个叠层`; }
   } else { badge.className = 'badge idle'; badge.textContent = ''; }
+
+  // 只读审阅锁定：在所有卡片渲染之后再强制禁用变更控件
+  applyReviewLock();
 }
 
 function renderSteps() {
@@ -315,6 +353,16 @@ function renderSteps() {
     return;
   }
   const dirText = { l: '◀ 向左折', r: '▶ 向右折', u: '▲ 向上折', d: '▼ 向下折' };
+  // 当前审阅版本的步骤差异标记（index → op）
+  const stepDiff = new Map();
+  const dstate = app.versions.diff;
+  if (dstate && app.versions.review) {
+    const isFrom = app.versions.review.version === dstate.fromV;
+    for (const ch of dstate.diff.changes) {
+      if (ch.kind !== 'step') continue;
+      stepDiff.set(ch.index, { op: ch.op, isFrom });
+    }
+  }
   // 逐步重放以标记非法步
   let st = E.initialState(app.plan.rows, app.plan.cols, app.plan.labels);
   app.plan.steps.forEach((s, i) => {
@@ -327,6 +375,12 @@ function renderSteps() {
       li.textContent += '（非法）';
     }
     if (i < app.upto && !err) li.classList.add('current');
+    const df = stepDiff.get(i);
+    if (df) {
+      // 仅当该侧版本在此序号确有该步（新增步在旧版本不存在）才标记
+      const existsOnSide = df.isFrom ? df.op !== 'add' : df.op !== 'remove';
+      if (existsOnSide) li.classList.add('diff-step', df.op === 'add' ? 'diff-add' : df.op === 'remove' ? 'diff-remove' : '');
+    }
     li.addEventListener('click', () => setUpto(i + 1));
     ol.appendChild(li);
     if (!err) st = E.applyFold(st, s);
@@ -423,11 +477,16 @@ function draw() {
   if (state) {
     const track = currentTrackInfo(state);
     const annoMap = currentAnnotationMarks(state);
+    const diffMarks = currentDiffMarks(state);
     for (const [cellKey, ids] of Object.entries(state.stacks)) {
       const [cx, cy] = cellKey.split(',').map(Number);
       drawStack(cx, cy, ids, state, conflicts.has(cellKey), movingCells.has(cellKey),
         track && track.cell === cellKey ? track : null,
-        annoMap.get(cellKey) || null);
+        annoMap.get(cellKey) || null,
+        diffMarks && {
+          origins: diffMarks.affectedOriginByCell.get(cellKey) || null,
+          focus: diffMarks.focusAtNow.has(cellKey)
+        });
     }
   }
 
@@ -495,10 +554,19 @@ function line(x1, y1, x2, y2) {
   ctx.stroke();
 }
 
-function drawStack(cx, cy, ids, state, conflict, moving, track, anno) {
+function drawStack(cx, cy, ids, state, conflict, moving, track, anno, diff) {
   const { x, y } = originXY(cx, cy);
   const depth = ids.length;
   const trackLayer = track ? track.layer : 0;   // 1 = 最上层
+
+  // 差异受影响的原始纸格：按其在叠中的层序画紫色偏移描边（夹在层中也可见）
+  const diffOriginLayers = new Map();   // layer(1基) -> 'focus'|'normal'
+  if (diff && diff.origins) {
+    ids.forEach((id, i) => {
+      if (diff.origins.has(id)) diffOriginLayers.set(i + 1, 'normal');
+    });
+  }
+  const diffFocus = !!(diff && diff.focus);
 
   // 叠层阴影面片
   for (let i = depth - 1; i >= 1; i--) {
@@ -516,22 +584,50 @@ function drawStack(cx, cy, ids, state, conflict, moving, track, anno) {
     ctx.strokeStyle = '#e8820c';
     ctx.stroke();
   }
+  // 差异面片按层描边：聚焦差异实色加粗，普通差异紫色虚线
+  if (diffOriginLayers.size) {
+    for (const layer of diffOriginLayers.keys()) {
+      if (layer === 1) continue;   // 顶层在顶面描边处统一处理
+      const li = layer - 1;
+      roundRect(x + li * 2.5, y - li * 2.5, CELL - 8, CELL - 8, 6);
+      ctx.save();
+      ctx.setLineDash([4, 3]);
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = '#7c3aed';
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
 
   // 顶面片
   const top = state.panels[ids[0]];
   const { side, upright } = E.visibleFace(top);
   const label = top[side];
   const isTrackTop = track && trackLayer === 1;
+  const topIsDiff = diffOriginLayers.has(1);
   roundRect(x, y, CELL - 8, CELL - 8, 6);
   ctx.fillStyle = conflict ? '#fde0dd'
     : isTrackTop ? '#fff1de'
-    : moving ? '#dbeafe' : '#fdfaf1';
+    : moving ? '#dbeafe'
+    : diffFocus && topIsDiff ? '#f3e8ff'
+    : topIsDiff ? '#f7f2ff' : '#fdfaf1';
   ctx.fill();
   ctx.lineWidth = conflict ? 2.5 : isTrackTop ? 2.5 : moving ? 2 : 1.2;
   ctx.strokeStyle = conflict ? '#d64545'
     : isTrackTop ? '#e8820c'
     : moving ? '#2f6fed' : '#b99e5e';
   ctx.stroke();
+  // 顶层差异面片：紫色虚线外框（聚焦差异实色加粗）
+  if (topIsDiff) {
+    ctx.save();
+    if (!diffFocus) ctx.setLineDash([5, 3]);
+    ctx.lineWidth = diffFocus ? 3 : 2;
+    ctx.strokeStyle = diffFocus ? '#5b21b6' : '#7c3aed';
+    roundRect(x - (diffFocus ? 3 : 2), y - (diffFocus ? 3 : 2),
+      CELL - 8 + (diffFocus ? 6 : 4), CELL - 8 + (diffFocus ? 6 : 4), 8);
+    ctx.stroke();
+    ctx.restore();
+  }
 
   // 批注定位高亮：所选批注绑定的面片所在叠（与追踪高亮可并存），青色描边
   if (anno && anno.selectedFace) {
@@ -788,6 +884,11 @@ function onCanvasMove(e) {
 // ---------- 纸格编辑器 ----------
 function openEditor(cellKey) {
   if (!app.replay) return;
+  if (app.versions.review) {
+    // 审阅模式下点击纸格：不打开编辑弹层，改为定位差异（若该格受影响）
+    focusDiffAtCell(cellKey);
+    return;
+  }
   const state = app.replay.state;
   const ids = state.stacks[cellKey];
   if (!ids) return;
@@ -884,6 +985,10 @@ const FACE_NAME = { front: '正面', back: '反面' };
  */
 function openAnnotationEditor(cell, face, targetId) {
   if (!app.plan.rows) return;
+  if (app.versions.review) {
+    $('saveMsg').textContent = '历史版本为只读快照，批注不可在审阅模式下编辑。';
+    return;
+  }
   let rec;
   if (targetId) {
     rec = annotations().find((a) => a.id === targetId);
@@ -1200,6 +1305,7 @@ function closeImposition() {
 
 /** 点击“生成预览”：仅计算并展示，绝不直接改写当前标注。 */
 function previewImposition() {
+  if (reviewGuard()) return;
   const { start, count } = readImposeInputs();
   const result = E.autoImpose(
     app.plan.rows, app.plan.cols, app.plan.labels, app.plan.steps, start, count);
@@ -1380,6 +1486,7 @@ function renderPathfind() {
 
 /** 点击搜索：先显示“搜索中”，下一帧再执行同步 BFS（≤2s），避免界面无反馈。 */
 function runPathfind() {
+  if (reviewGuard()) return;
   if (!app.plan.rows || app.plan.rows > 4 || app.plan.cols > 4) return;
   if (!$('pathCell').value) return;
   const btn = $('pathSearchBtn');
@@ -1467,6 +1574,7 @@ function renderPathResults(result) {
 
 /** 把任一搜索方案追加为后续步骤，进入既有回放流程（末态）。 */
 function appendPathSolution(sol) {
+  if (reviewGuard()) return;
   if (!app.pathfind.result || app.pathfind.sig !== pathfindSignature()) return;
   for (const st of sol.steps) {
     const base = E.replay(app.plan.rows, app.plan.cols, app.plan.labels, app.plan.steps).state;
@@ -1669,6 +1777,8 @@ function renderDuplex() {
 
 /** 打开覆盖层并生成两版。 */
 function openDuplex() {
+  // 审阅模式允许只读查看双面版（不修改方案）
+  if (!app.versions.review && reviewGuard()) return;
   if (!app.duplex.eligible || !app.duplex.eligible.ok) return;
   app.duplex.flip = $('duplexFlip').value === 'short' ? 'short' : 'long';
   $('duplexFlipOverlay').value = app.duplex.flip;
@@ -1940,6 +2050,7 @@ function renderCreepApplied(scheme, current) {
 
 /** 应用：把当前参数与逐面偏移固化到 plan.creepCompensation 独立字段。 */
 function applyCreep() {
+  if (reviewGuard()) return;
   const { result } = computeCreep();
   if (!result.ok || !result.canApply) return;
   const faces = {};
@@ -1971,6 +2082,7 @@ function applyCreep() {
 
 /** 清除已应用字段（实时明细表仍按当前参数展示）。 */
 function clearCreep() {
+  if (reviewGuard()) return;
   delete app.plan.creepCompensation;
   renderCreep();
   $('saveMsg').textContent = '已清除爬移补偿独立字段（需保存方案后生效）。';
@@ -2191,6 +2303,21 @@ function applyPlan(plan, id) {
   app.loadedId = id || null;
   app.annotation.editing = null;
   app.annotation.selectedId = null;
+  resetVersionState();
+  hydratePlanForm(p);
+  refreshLineSelect();
+  setUpto(p.steps.length, true);
+  $('deletePlanBtn').hidden = !id;
+  fillVersionSelectors([]);
+  $('saveMsg').textContent = id
+    ? `已载入服务器存档 ${id}（批注 ${p.annotations.length} 条）`
+    : `已载入 JSON 文件（批注 ${p.annotations.length} 条）`;
+  // 载入服务器存档后拉取其不可变版本列表；导入本地 JSON 无版本
+  if (id) refreshVersions(id);
+}
+
+/** 把方案内容回填到编辑控件（正常载入与历史版本审阅共用）。 */
+function hydratePlanForm(p) {
   $('annoOpenOnly').checked = false;
   $('annoSeverityFilter').value = '';
   $('annoFaceFilter').value = '';
@@ -2204,16 +2331,14 @@ function applyPlan(plan, id) {
     $('creepThickness').value = p.creepCompensation.params.paperThickness;
     $('creepBleed').value = p.creepCompensation.params.bleed;
   }
-  refreshLineSelect();
-  setUpto(p.steps.length, true);
-  $('deletePlanBtn').hidden = !id;
-  $('saveMsg').textContent = id
-    ? `已载入服务器存档 ${id}（批注 ${p.annotations.length} 条）`
-    : `已载入 JSON 文件（批注 ${p.annotations.length} 条）`;
 }
 
 async function savePlan() {
   if (!app.plan.rows) { $('saveMsg').textContent = '请先创建网格。'; return; }
+  if (app.versions.review) {
+    $('saveMsg').textContent = '历史版本为只读快照，不能直接保存；请先“恢复为当前草稿”或“返回当前草稿”。';
+    return;
+  }
   // 与服务端同一份严格校验：非法标签/过长输入在本地即被拦下，请求也不会改动旧存档
   try {
     E.normalizePlanMeta(planPayload());
@@ -2234,15 +2359,23 @@ async function savePlan() {
     const resp = await fetch('/api/plans', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...planPayload(), id: app.loadedId || undefined })
+      body: JSON.stringify({
+        ...planPayload(),
+        id: app.loadedId || undefined,
+        restoredFromVersion: app.versions.restoreMarker || undefined
+      })
     });
     const data = await resp.json();
     if (!data.ok) throw new Error(data.error.message);
     app.loadedId = data.id;
+    app.versions.planId = data.id;
+    app.versions.restoreMarker = null;
     app.plan.tags = data.plan.tags;
     if (Array.isArray(data.plan.annotations)) app.plan.annotations = data.plan.annotations;
     $('deletePlanBtn').hidden = false;
-    $('saveMsg').textContent = `已保存：${data.id}（${new Date().toLocaleTimeString()}）`;
+    $('saveMsg').textContent = `已保存：${data.id}（${new Date().toLocaleTimeString()}，版本 v${data.version}）`;
+    // 刷新不可变版本列表：默认选中最近两个版本便于立即比较
+    await refreshVersions(data.id, { selectLatest: true });
     // 列表若处于打开状态则自动刷新（沿用当前筛选）
     if (!$('planList').hidden) loadList();
   } catch (e) {
@@ -2251,6 +2384,7 @@ async function savePlan() {
 }
 
 function exportPlan() {
+  if (reviewGuard('历史版本为只读快照，请先恢复为草稿再导出。')) return;
   if (!app.plan.rows) { $('saveMsg').textContent = '请先创建网格。'; return; }
   const blob = new Blob([JSON.stringify(planPayload(), null, 2)], { type: 'application/json' });
   const a = document.createElement('a');
@@ -2263,6 +2397,11 @@ function exportPlan() {
 function importPlan(e) {
   const file = e.target.files[0];
   if (!file) return;
+  if (app.versions.review) {
+    e.target.value = '';
+    reviewGuard('请先退出版本审阅（返回草稿或恢复为草稿）再导入方案。');
+    return;
+  }
   const reader = new FileReader();
   reader.onload = () => {
     try {
@@ -2364,12 +2503,556 @@ function renderPlanList(data) {
 
 async function deleteLoaded() {
   if (!app.loadedId) return;
-  if (!confirm('确定删除服务器上的该存档？')) return;
+  if (!confirm('确定删除服务器上的该存档？将同时删除全部不可变历史版本。')) return;
   await fetch(`/api/plans/${app.loadedId}`, { method: 'DELETE' });
   app.loadedId = null;
+  resetVersionState();
+  fillVersionSelectors([]);
+  renderVersionCard();
   $('deletePlanBtn').hidden = true;
-  $('saveMsg').textContent = '已删除存档（本地方案仍保留）';
+  $('saveMsg').textContent = '已删除存档及其历史版本（本地方案仍保留）';
   if (!$('planList').hidden) loadList();
+}
+
+// ==========================================================================
+// 版本差异审阅
+// --------------
+// 每次成功保存后服务端保留不可变快照；前端选择同一方案的两个版本：
+//   - 以原始纸格 + 步骤序号为稳定身份展示增删改；
+//   - 画布紫色高亮受影响纸格，点击差异联动回放对应版本（只读审阅）；
+//   - 任一历史版本可恢复为当前草稿（确认后作为新草稿，不覆盖任何历史；
+//     下一次保存沿既有流程追加新版本）。
+// ==========================================================================
+
+/** 审阅模式守卫：处于只读审阅时拦截一切方案变更操作。 */
+function reviewGuard(msg) {
+  if (!app.versions.review) return false;
+  $('saveMsg').textContent = msg
+    || '正在审阅历史只读版本：请先“返回当前草稿”或“恢复为当前草稿”。';
+  return true;
+}
+
+function resetVersionState() {
+  app.versions.planId = null;
+  app.versions.list = null;
+  app.versions.diff = null;
+  app.versions.review = null;
+  app.versions.restoreMarker = null;
+  app.diffFocus = { cells: [], step: null, annoId: null };
+}
+
+/** 保存成功后刷新版本卡（失败静默：版本为保存的附属能力，不阻断主流程提示）。 */
+async function refreshVersions(planId, { selectLatest } = {}) {
+  if (!planId) return;
+  try {
+    const resp = await fetch(`/api/plans/${encodeURIComponent(planId)}/versions`);
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) throw new Error((data.error && data.error.message) || `HTTP ${resp.status}`);
+    app.versions.planId = planId;
+    app.versions.list = data.versions;
+    fillVersionSelectors(data.versions, selectLatest ? { from: Math.max(1, data.latest - 1), to: data.latest } : null);
+    renderVersionCard();
+  } catch (e) {
+    $('versionStatus').textContent = '历史版本读取失败：' + e.message;
+  }
+}
+
+function versionLabel(v) {
+  const t = v.savedAt ? new Date(v.savedAt).toLocaleString() : '时间未知';
+  const reason = v.reason === 'restore'
+    ? `（恢复自 v${v.restoredFromVersion || '?'}）` : '';
+  return `v${v.version} · ${t}${reason} · ${v.steps} 步 · 批注 ${v.annotations}`;
+}
+
+function fillVersionSelectors(list, prefer) {
+  const fill = (sel, placeholder) => {
+    sel.innerHTML = '';
+    const o0 = document.createElement('option');
+    o0.value = '';
+    o0.textContent = placeholder;
+    sel.appendChild(o0);
+    (list || []).forEach((v) => {
+      const o = document.createElement('option');
+      o.value = String(v.version);
+      o.textContent = versionLabel(v);
+      sel.appendChild(o);
+    });
+  };
+  fill($('diffTo'), '选择新版本…');
+  const sFrom = $('diffFrom');
+  const sTo = $('diffTo');
+  const listArr = list || [];
+  if (listArr.length >= 2) {
+    sFrom.value = String(prefer && listArr.some((v) => v.version === prefer.from)
+      ? prefer.from : listArr[listArr.length - 2].version);
+    sTo.value = String(prefer && listArr.some((v) => v.version === prefer.to)
+      ? prefer.to : listArr[listArr.length - 1].version);
+  }
+  $('diffBtn').disabled = listArr.length < 2 || !sFrom.value || !sTo.value
+    || sFrom.value === sTo.value;
+}
+
+function renderVersionCard() {
+  const st = $('versionStatus');
+  const btn = $('reviewVersionsBtn');
+  const list = app.versions.list;
+  btn.hidden = !list || list.length === 0;
+  if (!app.loadedId) {
+    st.textContent = '保存方案到服务器后即可比较历史版本。';
+  } else if (!list) {
+    st.textContent = '版本列表尚未加载，保存方案后自动加载。';
+  } else if (list.length === 0) {
+    st.textContent = '该存档还没有版本快照（再次保存即生成首个不可变版本）。';
+  } else {
+    st.textContent = `共 ${list.length} 个不可变版本：最新 v${list[list.length - 1].version}` +
+      `（${new Date(list[list.length - 1].savedAt).toLocaleString()}）。` +
+      (list.length < 2 ? '再保存一次即可比较两个版本。' : '选择两个版本后点“比较版本”。');
+  }
+  syncReviewBanner();
+  syncReviewLocks();
+}
+
+/** 点击“比较版本”：拉取差异并进入较新版本的只读审阅。 */
+async function compareVersions() {
+  const sFrom = $('diffFrom');
+  const sTo = $('diffTo');
+  const fromV = Number(sFrom.value);
+  const toV = Number(sTo.value);
+  const st = $('versionStatus');
+  if (!app.loadedId || !fromV || !toV || fromV === toV) {
+    st.textContent = '请选择两个不同的版本进行比较。';
+    return;
+  }
+  st.textContent = '正在比较版本…';
+  try {
+    // 版本允许任意顺序比较：展示统一以较早者为 A（from）、较晚者为 B（to）
+    const lo = Math.min(fromV, toV);
+    const hi = Math.max(fromV, toV);
+    const resp = await fetch(`/api/plans/${encodeURIComponent(app.loadedId)}/diff?from=${lo}&to=${hi}`);
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) throw new Error((data.error && data.error.message) || `HTTP ${resp.status}`);
+    app.versions.diff = { fromV: lo, toV: hi, envelope: data, diff: data.diff };
+    app.diffFocus = { cells: [], step: null, annoId: null };
+    renderDiffList();
+    // 进入较新版本的只读审阅（当前草稿压栈保存）
+    await enterReview(hi);
+  } catch (e) {
+    st.textContent = '版本比较失败：' + e.message;
+  }
+}
+
+function renderDiffList() {
+  const state = app.versions.diff;
+  const box = $('diffList');
+  const sum = $('diffSummary');
+  box.innerHTML = '';
+  if (!state) { box.hidden = true; sum.hidden = true; return; }
+  const { diff, fromV, toV } = state;
+  const s = diff.summary;
+  sum.hidden = false;
+  const interruptedNote = diff.geometryInterrupted.from || diff.geometryInterrupted.to
+    ? '（某一版本含非法折叠，几何比对按截断态进行）' : '';
+  sum.innerHTML =
+    `v${fromV} → v${toV}：共 <b>${s.total}</b> 项差异` +
+    `（新增 ${s.adds} · 删除 ${s.removes} · 修改 ${s.changes}），` +
+    `受影响原始纸格 <b>${s.affectedCells}</b> 个${interruptedNote}。` +
+    `分类：步骤 ${s.byKind.step || 0} · 页码 ${s.byKind.label || 0} · ` +
+    `批注 ${s.byKind.annotation || 0} · 标签备注 ${s.byKind.meta || 0} · ` +
+    `爬移 ${s.byKind.creep || 0} · 网格 ${s.byKind.grid || 0}。`;
+  box.hidden = false;
+  if (!diff.changes.length) {
+    box.innerHTML = '<li class="diff-empty">两个版本内容完全一致（无差异）。</li>';
+    return;
+  }
+  diff.changes.forEach((ch, i) => box.appendChild(renderDiffItem(ch, i)));
+}
+
+const DIFF_KIND_NAME = {
+  grid: '网格', meta: '标签/备注', step: '折叠步骤',
+  label: '页码', annotation: '批注', creep: '爬移补偿'
+};
+const DIFF_OP_NAME = { add: '新增', remove: '删除', change: '修改' };
+
+function renderDiffItem(ch, idx) {
+  const li = document.createElement('li');
+  li.className = `diff-item op-${ch.op} kind-${ch.kind}`;
+  li.dataset.idx = String(idx);
+
+  const head = document.createElement('div');
+  const kind = document.createElement('span');
+  kind.className = 'diff-kind k-' + ch.kind;
+  kind.textContent = DIFF_KIND_NAME[ch.kind] || ch.kind;
+  const op = document.createElement('span');
+  op.className = 'diff-op op-' + ch.op;
+  op.textContent = DIFF_OP_NAME[ch.op] || ch.op;
+  const main = document.createElement('span');
+  main.className = 'diff-main';
+  main.innerHTML = diffItemTitle(ch);
+  head.append(kind, op, main);
+  li.appendChild(head);
+
+  const detail = diffItemDetail(ch);
+  if (detail) {
+    const d = document.createElement('div');
+    d.className = 'diff-detail';
+    d.innerHTML = detail;
+    li.appendChild(d);
+  }
+  if (ch.kind === 'annotation' && (ch.op === 'change' || ch.op === 'remove')) {
+    const oldNew = document.createElement('div');
+    oldNew.className = 'diff-old-new';
+    oldNew.appendChild(diffAnnoLine(ch.from, 'diff-old'));
+    if (ch.to) oldNew.appendChild(diffAnnoLine(ch.to, 'diff-new'));
+    li.appendChild(oldNew);
+  }
+
+  // 联动操作：在旧版本 / 新版本中查看（步骤差异两侧均可点；页码/批注差异仅点存在侧）
+  const actions = document.createElement('div');
+  actions.className = 'diff-actions';
+  const viewBtn = (version, text) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = text;
+    b.addEventListener('click', () => viewChangeAt(idx, version));
+    return b;
+  };
+  const existsFrom = ch.kind !== 'step' ? ch.op !== 'add' : !!ch.from;
+  const existsTo = ch.kind !== 'step' ? ch.op !== 'remove' : !!ch.to;
+  if (existsFrom) actions.appendChild(viewBtn(app.versions.diff.fromV, `在 v${app.versions.diff.fromV} 查看`));
+  if (existsTo) actions.appendChild(viewBtn(app.versions.diff.toV, `在 v${app.versions.diff.toV} 查看`));
+  li.appendChild(actions);
+  return li;
+}
+
+function diffItemTitle(ch) {
+  const faceText = (f) => f === 'front'
+    ? '<span class="imp-face-front">正面</span>'
+    : '<span class="imp-face-back">反面</span>';
+  if (ch.kind === 'grid') {
+    return `网格规格 ${ch.from.rows}×${ch.from.cols} → ${ch.to.rows}×${ch.to.cols}`;
+  }
+  if (ch.kind === 'meta') {
+    if (ch.field === 'name') return `方案名称：${escapeHtml(ch.from || '（空）')} → ${escapeHtml(ch.to || '（空）')}`;
+    if (ch.field === 'note') return `备注：${ch.op === 'add' ? '' : ch.op === 'remove' ? '' : ''}`
+      + `<b>${ch.op === 'add' ? '新增备注' : ch.op === 'remove' ? '删除备注' : '备注修改'}</b>`;
+    return `标签“${escapeHtml(ch.tag)}”${ch.op === 'add' ? '新增' : '移除'}`;
+  }
+  if (ch.kind === 'step') {
+    return `第 ${ch.index + 1} 步` +
+      (ch.op === 'add' ? `新增：${escapeHtml(ch.toText)}`
+        : ch.op === 'remove' ? `删除：${escapeHtml(ch.fromText)}`
+        : `修改：${escapeHtml(ch.fromText)} → ${escapeHtml(ch.toText)}`);
+  }
+  if (ch.kind === 'label') {
+    const ogf = ch.outOfGridFrom ? '（旧网格之外）' : '';
+    const ogt = ch.outOfGridTo ? '（新网格之外）' : '';
+    const val = (v) => v == null ? '<span class="muted">不存在</span>'
+      : v === '' ? '<span class="muted">空白</span>' : `“${escapeHtml(v)}”`;
+    return `原格(${ch.cell}) · ${faceText(ch.face)}${ogf}${ogt}：${val(ch.from)} → ${val(ch.to)}`;
+  }
+  if (ch.kind === 'annotation') {
+    const rec = ch.to || ch.from;
+    const sevName = { error: '严重', warning: '警告', info: '建议' };
+    const fieldsName = { cell: '原格', face: '面别', severity: '级别', text: '正文', resolved: '解决状态' };
+    const why = ch.op === 'change'
+      ? `（${ch.fields.map((f) => fieldsName[f] || f).join('、')}变化）` : '';
+    return `${DIFF_OP_NAME[ch.op]}批注 · 原格(${rec.cell}) · ${faceText(rec.face)}` +
+      ` · ${sevName[rec.severity] || rec.severity}${why}`;
+  }
+  if (ch.kind === 'creep') {
+    const side = (s) => !s ? '无'
+      : `纸厚 ${s.params && s.params.paperThickness} / 出血 ${s.params && s.params.bleed}` +
+        `（${s.faceCount} 格，最大补偿 ${s.maxCompensation}）`;
+    return `爬移补偿：${side(ch.from)} → ${side(ch.to)}`;
+  }
+  return '';
+}
+
+function diffItemDetail(ch) {
+  if (ch.kind === 'meta' && ch.field === 'note') {
+    return `<span class="diff-old">${ch.from ? '旧：' + escapeHtml(ch.from) : ''}</span>` +
+      `<span class="diff-new">${ch.to ? '新：' + escapeHtml(ch.to) : ''}</span>`;
+  }
+  if (ch.kind === 'step') {
+    const cells = (arr) => (arr || []).map((c) => `格(${c})`).join('、') || '—';
+    return `受影响原始纸格：旧 ${cells(ch.fromCells)} ｜ 新 ${cells(ch.toCells)}`;
+  }
+  if (ch.kind === 'annotation') {
+    const rec = ch.to || ch.from;
+    return escapeHtml(rec.text || '');
+  }
+  if (ch.kind === 'creep' && ch.changedCells && ch.changedCells.length) {
+    return `偏移变化的原始纸格：${ch.changedCells.map((c) => `格(${c})`).join('、')}`;
+  }
+  if (ch.kind === 'grid') {
+    const list = (arr, name) => arr.length ? `${name}：${arr.map((c) => `格(${c})`).join('、')}` : '';
+    return [list(ch.fromCells, '旧网格独有'), list(ch.toCells, '新网格独有')].filter(Boolean).join('；');
+  }
+  return '';
+}
+
+function diffAnnoLine(rec, cls) {
+  const sev = { error: '严重', warning: '警告', info: '建议' };
+  const span = document.createElement('div');
+  span.className = cls;
+  span.textContent = `${cls === 'diff-old' ? '旧' : '新'}：原格(${rec.cell}) · ` +
+    `${rec.face === 'front' ? '正面' : '反面'} · ${sev[rec.severity] || rec.severity} · ` +
+    `${rec.resolved ? '已解决' : '未解决'} · “${rec.text || ''}”`;
+  return span;
+}
+
+/**
+ * 点击差异行的“在 vN 查看”：载入该版本快照进入/切换只读审阅，
+ * 并按差异类型联动回放（步骤→对应步；页码/批注→该原格并高亮）。
+ */
+async function viewChangeAt(changeIndex, version) {
+  const ch = app.versions.diff.diff.changes[changeIndex];
+  await enterReview(version);
+  // 高亮当前差异行
+  document.querySelectorAll('#diffList .diff-item').forEach((el) =>
+    el.classList.toggle('diff-focus', Number(el.dataset.idx) === changeIndex));
+
+  // 聚焦信息（按所在版本的纸格集合）
+  const cells = ch.kind === 'step'
+    ? (version === app.versions.diff.fromV ? ch.fromCells : ch.toCells)
+    : (ch.cells || []);
+  const inGrid = cells.filter((k) => {
+    const [x, y] = k.split(',').map(Number);
+    return x < app.plan.cols && y < app.plan.rows;
+  });
+  let step = null;
+  let annoId = null;
+  if (ch.kind === 'step') {
+    // 新增步定位到执行后；删除步定位到该序号在旧版本中的状态
+    step = Math.min(ch.index + (ch.op === 'remove' ? 0 : 1), app.plan.steps.length);
+  } else if (ch.kind === 'label') {
+    step = app.plan.steps.length;
+  } else if (ch.kind === 'annotation') {
+    const rec = ch.op === 'remove' ? ch.from : ch.to;
+    annoId = rec.id;
+    step = Math.min(rec.step, app.plan.steps.length);
+  } else {
+    // 网格 / 标签备注 / 爬移补偿：无具体回放步，定位到末态
+    step = app.plan.steps.length;
+  }
+  app.diffFocus = { cells: inGrid, step, annoId, kind: ch.kind, index: ch.index };
+  if (annoId) app.annotation.selectedId = annoId;
+  setUpto(step == null ? app.plan.steps.length : step, true);
+  $('saveMsg').textContent = `正在审阅 v${version}：${DIFF_KIND_NAME[ch.kind]}差异已定位` +
+    (inGrid.length ? `，受影响纸格 ${inGrid.map((c) => `(${c})`).join('、')}。` : '。');
+}
+
+/** 审阅模式下点击画布纸格：若属于某条差异则定位到该差异。 */
+function focusDiffAtCell(cellKey) {
+  if (!app.versions.diff) return;
+  // cellKey 是当前格位，反查其中的原始纸格是否落在某差异上
+  const state = app.replay && app.replay.state;
+  if (!state) return;
+  const origins = (state.stacks[cellKey] || []).slice();
+  const changes = app.versions.diff.diff.changes;
+  for (let i = 0; i < changes.length; i++) {
+    const ch = changes[i];
+    const cells = ch.kind === 'step'
+      ? (app.versions.review.version === app.versions.diff.fromV ? ch.fromCells : ch.toCells)
+      : (ch.cells || []);
+    if (origins.some((id) => cells.includes(id))) { viewChangeAt(i, app.versions.review.version); return; }
+  }
+  $('saveMsg').textContent = `格(${cellKey}) 中原始纸格 ${origins.map((o) => `(${o})`).join('、')} 在两版本间无差异。`;
+}
+
+/** 进入（或切换）历史版本只读审阅：首次进入时压栈当前草稿。 */
+async function enterReview(version) {
+  const planId = app.loadedId || app.versions.planId;
+  if (!planId) return;
+  try {
+    const resp = await fetch(`/api/plans/${encodeURIComponent(planId)}/versions/${version}`);
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) throw new Error((data.error && data.error.message) || `HTTP ${resp.status}`);
+
+    const stash = app.versions.review
+      ? app.versions.review.stash        // 已在审阅中切换版本：保留最初草稿
+      : {
+        plan: JSON.parse(JSON.stringify(app.plan)),
+        upto: app.upto,
+        loadedId: app.loadedId
+      };
+
+    const p = E.normalizePlan(data.plan);
+    app.plan = p;
+    app.annotation.editing = null;
+    app.annotation.selectedId = null;
+    hydratePlanForm(p);
+    refreshLineSelect();
+    app.versions.review = {
+      version,
+      savedAt: data.savedAt,
+      reason: data.reason,
+      restoredFromVersion: data.restoredFromVersion,
+      stash
+    };
+    setUpto(p.steps.length, true);
+    syncReviewBanner();
+    syncReviewLocks();
+    draw();
+  } catch (e) {
+    $('versionStatus').textContent = '历史版本载入失败：' + e.message;
+  }
+}
+
+/** 退出版本审阅：恢复压栈的当前草稿。 */
+function exitReview() {
+  const review = app.versions.review;
+  if (!review) return;
+  const p = E.normalizePlan(review.stash.plan);
+  app.plan = p;
+  app.loadedId = review.stash.loadedId;
+  app.annotation.editing = null;
+  app.annotation.selectedId = null;
+  app.versions.review = null;
+  app.versions.diff = null;
+  app.diffFocus = { cells: [], step: null, annoId: null };
+  $('diffList').hidden = true;
+  $('diffList').innerHTML = '';
+  $('diffSummary').hidden = true;
+  hydratePlanForm(p);
+  refreshLineSelect();
+  setUpto(Math.min(review.stash.upto, p.steps.length), true);  // 渲染恢复控件状态
+  syncReviewBanner();
+  $('saveMsg').textContent = '已返回当前草稿（历史版本未做任何改动）。';
+}
+
+/** 把审阅中的历史版本恢复为当前草稿：确认后退出审阅，历史不被覆盖。 */
+function restoreReviewedVersion() {
+  const review = app.versions.review;
+  if (!review) return;
+  const restoredFrom = review.version;
+  if (!confirm(
+    `将把历史版本 v${restoredFrom} 恢复为当前草稿。\n\n` +
+    '· 历史版本为不可变快照，不会被覆盖或删除；\n' +
+    '· 当前未保存的草稿内容将被该历史版本替换；\n' +
+    '· 恢复后请使用“保存到服务器”沿既有流程保存——将产生新的版本号。\n\n' +
+    '确认恢复？')) return;
+  const p = JSON.parse(JSON.stringify(app.plan));
+  app.loadedId = review.stash.loadedId;
+  app.versions.review = null;
+  app.versions.diff = null;
+  app.diffFocus = { cells: [], step: null, annoId: null };
+  app.versions.restoreMarker = restoredFrom;
+  app.plan = E.normalizePlan(p);
+  hydratePlanForm(app.plan);
+  refreshLineSelect();
+  $('diffList').hidden = true;
+  $('diffList').innerHTML = '';
+  $('diffSummary').hidden = true;
+  syncReviewBanner();
+  setUpto(app.plan.steps.length, true);
+  $('saveMsg').textContent =
+    `已把 v${restoredFrom} 恢复为当前草稿（历史保留不变）。检查无误后点“保存到服务器”生成新版本。`;
+}
+
+function syncReviewBanner() {
+  const banner = $('reviewBanner');
+  const review = app.versions.review;
+  banner.hidden = !review;
+  if (!review) return;
+  const t = review.savedAt ? new Date(review.savedAt).toLocaleString() : '时间未知';
+  const reason = review.reason === 'restore'
+    ? `（该版本由恢复 v${review.restoredFromVersion || '?'} 后保存产生）` : '';
+  $('reviewBannerText').innerHTML =
+    `🔎 正在<b>只读审阅</b>不可变历史版本 <b>v${review.version}</b>（${t}）${reason}。<br>` +
+    '编辑操作已锁定；可继续使用回放、面片轨迹、审计与双面版预览。' +
+    '点差异行联动回放；完成后“返回当前草稿”，或把该版本“恢复为当前草稿”。';
+}
+
+/** 审阅模式下锁定全部方案变更控件（回放/筛选/只读卡片保持可用）。 */
+const REVIEW_LOCK_IDS = [
+  'createGridBtn',
+  'delStepBtn', 'clearStepsBtn',
+  'saveBtn', 'exportBtn', 'importBtn',
+  'tagAddBtn', 'tagClearBtn',
+  'imposePreviewBtn', 'imposeConfirmBtn',
+  'pathSearchBtn',
+  'creepApplyBtn', 'creepClearBtn',
+  'annoSaveBtn', 'annoDeleteBtn',
+  'deletePlanBtn'
+];
+const REVIEW_READONLY_IDS = [
+  'planName', 'planNote', 'tagInput',
+  'imposeStart', 'imposeCount',
+  'creepThickness', 'creepBleed', 'annoText'
+];
+
+/**
+ * 在每轮渲染之后应用审阅锁：锁定集合内控件强制 disabled / readOnly；
+ * 解锁后不做任何处理——各卡片自身的渲染会按正常条件恢复启用状态。
+ * 折叠四按钮通过 button.fold 集合单独处理。
+ */
+function applyReviewLock() {
+  const locked = !!app.versions.review;
+  // 未锁定时不干预：各卡片自身渲染按业务条件决定启用/禁用
+  if (!locked) {
+    $('diffLegend').hidden = true;
+    return;
+  }
+  for (const id of REVIEW_LOCK_IDS) {
+    const el = $(id);
+    if (el) el.disabled = true;
+  }
+  document.querySelectorAll('button.fold').forEach((b) => { b.disabled = true; });
+  for (const id of REVIEW_READONLY_IDS) {
+    const el = $(id);
+    if (el) el.readOnly = true;
+  }
+  $('diffLegend').hidden = !(app.versions.diff);
+}
+
+function syncReviewLocks() {
+  applyReviewLock();
+}
+
+/** 当前差异高亮信息：受影响原始纸格集合（映射到当前版本格位）+ 聚焦集合。 */
+function currentDiffMarks(state) {
+  const dstate = app.versions.diff;
+  if (!dstate || !state) return null;
+  const reviewV = app.versions.review && app.versions.review.version;
+  if (reviewV !== dstate.fromV && reviewV !== dstate.toV) return null;
+  const isFrom = reviewV === dstate.fromV;
+  const changed = new Set();
+  for (const ch of dstate.diff.changes) {
+    if (ch.kind === 'step') {
+      (isFrom ? ch.fromCells : ch.toCells).forEach((c) => changed.add(c));
+    } else {
+      (ch.cells || []).forEach((c) => changed.add(c));
+    }
+  }
+  // 末态几何变化（步骤增删导致位置/层序/朝向变化）也纳入
+  const changedAtNow = new Set();
+  const focusAtNow = new Set();
+  const mapOrigin = (originSet, target) => {
+    for (const id of originSet) {
+      const p = state.panels[id];
+      if (p) target.add(p.cx + ',' + p.cy);
+    }
+  };
+  mapOrigin(changed, changedAtNow);
+  // 未在变化条目中出现、但终态几何不同的原格
+  for (const id of dstate.diff.affectedCells || []) {
+    changed.add(id);
+    const p = state.panels[id];
+    if (p) changedAtNow.add(p.cx + ',' + p.cy);
+  }
+  const focusOrigins = new Set(app.diffFocus.cells || []);
+  mapOrigin(focusOrigins, focusAtNow);
+  // 当前格位 → 该格叠中受影响的原始纸格 id（用于按层描边）
+  const affectedOriginByCell = new Map();
+  for (const id of changed) {
+    const p = state.panels[id];
+    if (!p) continue;
+    const at = p.cx + ',' + p.cy;
+    if (!affectedOriginByCell.has(at)) affectedOriginByCell.set(at, new Set());
+    affectedOriginByCell.get(at).add(id);
+  }
+  return { affectedOriginByCell, focusAtNow, isFrom };
 }
 
 init();
@@ -2390,6 +3073,11 @@ if (typeof window !== 'undefined') {
     openAnnotationEditor, closeAnnotationEditor, commitAnnotation,
     deleteEditingAnnotation, setAnnotationResolved, deleteAnnotation,
     locateAnnotation, renderAnnotations, annotationLocations, currentAnnotationMarks,
-    annotations
+    annotations,
+    // 版本差异审阅
+    refreshVersions, compareVersions, renderVersionCard, renderDiffList,
+    fillVersionSelectors, enterReview, exitReview, restoreReviewedVersion,
+    viewChangeAt, focusDiffAtCell, currentDiffMarks, resetVersionState,
+    reviewGuard, applyReviewLock
   });
 }

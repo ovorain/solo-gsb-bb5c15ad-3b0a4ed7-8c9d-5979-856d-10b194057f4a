@@ -1562,6 +1562,293 @@ function locateAnnotations(rows, cols, labels, steps, upto, annotations) {
   return { ok: true, upto, interrupted: r.error, points };
 }
 
+/**
+ * 版本差异审阅（plan diff）
+ * * ----------------------
+ * 比较同一方案的两个<b>不可变历史版本快照</b>。稳定身份约定：
+ *
+ *   - 纸格：原始纸格坐标 "x,y"（列,行，0 基）+ 面别 front/back；
+ *   - 折叠步骤：步骤序号（0 基索引，第 1 步为 0），插入/删除一步后，
+ *     此后的所有序号按规格视为“对应身份变化”（按序号逐位比对）；
+ *   - 校样批注：批注 id；
+ *   - 标签：规范化后的标签集合（纯顺序调整不报差异）。
+ *
+ * changes 按稳定顺序输出：grid → meta → step → label → annotation → creep，
+ * 每条带 op（add / remove / change）与 cells（关联的原始纸格，供画布高亮）。
+ * affectedCells 为全部受影响原始纸格的并集（页码变化、批注变化、
+ * 折叠几何末态变化、爬移偏移变化等），按行、列排序。
+ *
+ * 两个版本之一含非法折叠时不影响差异计算：geometryInterrupted 分别给出
+ * 两侧的首个非法步骤（stepIndex/code/conflicts），几何比对按截断态进行。
+ */
+
+/** 数字排序的纸格数组（去重、先行后列）。 */
+function sortCellList(cells) {
+  return [...new Set(cells.filter(Boolean))].sort((a, b) => {
+    const [x1, y1] = String(a).split(',').map(Number);
+    const [x2, y2] = String(b).split(',').map(Number);
+    return y1 - y2 || x1 - x2;
+  });
+}
+
+/**
+ * 第 index 步执行前的移动侧原始纸格（该步的“影响面”）。
+ * @returns { cells: string[], invalid?:boolean }
+ *   合法时 cells 为移动叠内全部原始面片；非法时 cells 取冲突纸格内的原始面片。
+ */
+function stepMovingOriginIds(plan, index) {
+  const rows = Number(plan.rows), cols = Number(plan.cols);
+  const list = Array.isArray(plan.steps) ? plan.steps : [];
+  const upto = Math.max(0, Math.min(index, list.length));
+  const r = replay(rows, cols, plan.labels, list, upto);
+  const st = list[index];
+  if (!st) return { cells: [] };
+  const err = validateFold(r.state, st);
+  if (err) {
+    const cells = [];
+    for (const c of err.conflicts) for (const id of (r.state.stacks[c] || [])) cells.push(id);
+    return { cells: sortCellList(cells), invalid: true };
+  }
+  const movingSide = { r: 'l', l: 'r', d: 'u', u: 'd' }[st.dir];
+  const cells = [];
+  for (const [cell, ids] of Object.entries(r.state.stacks)) {
+    const [cx, cy] = cell.split(',').map(Number);
+    const side = st.axis === 'v' ? (cx < st.line ? 'l' : 'r')
+      : (cy < st.line ? 'u' : 'd');
+    if (side === movingSide) cells.push(...ids);   // 叠内 id 即原始纸格身份
+  }
+  return { cells: sortCellList(cells) };
+}
+
+/** 方案完整重放后的末态布局：原始纸格 → {at 当前格位, layer 叠内层序, frame 朝向键}。 */
+function terminalLayout(plan) {
+  const list = Array.isArray(plan.steps) ? plan.steps : [];
+  const r = replay(Number(plan.rows), Number(plan.cols), plan.labels, list);
+  const map = {};
+  for (const [at, ids] of Object.entries(r.state.stacks)) {
+    ids.forEach((id, layer) => {
+      map[id] = { at, layer: layer + 1, frame: frameKey(r.state.panels[id].frame) };
+    });
+  }
+  return {
+    map,
+    error: r.error
+      ? { stepIndex: r.error.stepIndex, code: r.error.code, conflicts: r.error.conflicts }
+      : null
+  };
+}
+
+/** 两个版本方案的结构化差异（入参会先经 normalizePlan 宽容规整）。 */
+function diffPlans(rawFrom, rawTo) {
+  const from = normalizePlan(rawFrom || {});
+  const to = normalizePlan(rawTo || {});
+  const changes = [];
+  const affected = new Set();
+  const touch = (cells) => sortCellList(cells || []).forEach((c) => affected.add(c));
+  const counts = { add: 0, remove: 0, change: 0 };
+  const byKind = { grid: 0, meta: 0, step: 0, label: 0, annotation: 0, creep: 0 };
+
+  const addChange = (c) => {
+    changes.push(c);
+    byKind[c.kind] = (byKind[c.kind] || 0) + 1;
+    if (c.op === 'add') counts.add++;
+    else if (c.op === 'remove') counts.remove++;
+    else counts.change++;
+    touch(c.cells);
+  };
+
+  // —— 网格尺寸 ——
+  if (from.rows !== to.rows || from.cols !== to.cols) {
+    const exclusive = [];
+    for (let y = 0; y < Math.max(from.rows, to.rows); y++) {
+      for (let x = 0; x < Math.max(from.cols, to.cols); x++) {
+        const inF = x < from.cols && y < from.rows;
+        const inT = x < to.cols && y < to.rows;
+        if (inF !== inT) exclusive.push(`${x},${y}`);
+      }
+    }
+    addChange({
+      kind: 'grid', op: 'change',
+      from: { rows: from.rows, cols: from.cols },
+      to: { rows: to.rows, cols: to.cols },
+      fromCells: sortCellList(exclusive.filter((k) => {
+        const [x, y] = k.split(',').map(Number);
+        return x < from.cols && y < from.rows;
+      })),
+      toCells: sortCellList(exclusive.filter((k) => {
+        const [x, y] = k.split(',').map(Number);
+        return x < to.cols && y < to.rows;
+      })),
+      cells: sortCellList(exclusive)
+    });
+  }
+
+  // —— 元信息：名称 / 备注 / 标签（集合差；纯重排不报）——
+  if ((from.name || '') !== (to.name || '')) {
+    addChange({ kind: 'meta', field: 'name', op: 'change', from: from.name || '', to: to.name || '', cells: [] });
+  }
+  if ((from.note || '') !== (to.note || '')) {
+    addChange({ kind: 'meta', field: 'note', op: 'change', from: from.note || '', to: to.note || '', cells: [] });
+  }
+  for (const t of to.tags) {
+    if (!from.tags.includes(t)) addChange({ kind: 'meta', field: 'tags', op: 'add', tag: t, cells: [] });
+  }
+  for (const t of from.tags) {
+    if (!to.tags.includes(t)) addChange({ kind: 'meta', field: 'tags', op: 'remove', tag: t, cells: [] });
+  }
+
+  // —— 折叠步骤（稳定身份 = 步骤序号）——
+  const stepCount = Math.max(from.steps.length, to.steps.length);
+  for (let i = 0; i < stepCount; i++) {
+    const fs = from.steps[i] || null;
+    const ts = to.steps[i] || null;
+    if (fs && ts && JSON.stringify(fs) === JSON.stringify(ts)) continue;
+    const fMove = fs ? stepMovingOriginIds(from, i) : { cells: [] };
+    const tMove = ts ? stepMovingOriginIds(to, i) : { cells: [] };
+    addChange({
+      kind: 'step', index: i,
+      op: !fs ? 'add' : !ts ? 'remove' : 'change',
+      from: fs, to: ts,
+      fromText: fs ? describeStep(fs) : null,
+      toText: ts ? describeStep(ts) : null,
+      fromCells: fMove.cells, toCells: tMove.cells,
+      fromInvalid: !!fMove.invalid, toInvalid: !!tMove.invalid,
+      cells: sortCellList(fMove.cells.concat(tMove.cells))
+    });
+  }
+
+  // —— 正反面页码（稳定身份 = 原始纸格 + 面别）——
+  const faceVal = (plan, k, face, inBounds) => {
+    if (!inBounds) return null;             // 该版本网格中不存在此纸格
+    const v = plan.labels[k];
+    return v && v[face] != null ? String(v[face]) : '';
+  };
+  for (let y = 0; y < Math.max(from.rows, to.rows); y++) {
+    for (let x = 0; x < Math.max(from.cols, to.cols); x++) {
+      const k = `${x},${y}`;
+      const inF = x < from.cols && y < from.rows;
+      const inT = x < to.cols && y < to.rows;
+      for (const face of ['front', 'back']) {
+        const fv = faceVal(from, k, face, inF);
+        const tv = faceVal(to, k, face, inT);
+        if (fv === tv) continue;            // 含“一侧越界、另一侧空白”——仅网格条报差异
+        // 一侧网格不含此格、另一侧为空白面：差异已由 grid 条承载，不重复报页码条
+        if ((fv == null && tv === '') || (tv == null && fv === '')) continue;
+        const op = fv == null || fv === '' ? 'add' : tv == null || tv === '' ? 'remove' : 'change';
+        addChange({
+          kind: 'label', cell: k, face, op,
+          from: fv, to: tv,
+          outOfGridFrom: !inF, outOfGridTo: !inT,
+          cells: [k]
+        });
+      }
+    }
+  }
+
+  // —— 校样批注（稳定身份 = 批注 id；仅创建步变化不报差异）——
+  const annoSlim = (a) => ({
+    id: a.id, cell: a.cell, face: a.face, severity: a.severity,
+    text: a.text, resolved: a.resolved === true, step: a.step
+  });
+  const fromAnno = new Map(from.annotations.map((a) => [a.id, a]));
+  const toAnno = new Map(to.annotations.map((a) => [a.id, a]));
+  for (const a of to.annotations) {
+    const old = fromAnno.get(a.id);
+    if (!old) {
+      addChange({ kind: 'annotation', op: 'add', from: null, to: annoSlim(a), cells: [a.cell] });
+      continue;
+    }
+    const fields = [];
+    if (old.cell !== a.cell) fields.push('cell');
+    if (old.face !== a.face) fields.push('face');
+    if (old.severity !== a.severity) fields.push('severity');
+    if (old.text !== a.text) fields.push('text');
+    if ((old.resolved === true) !== (a.resolved === true)) fields.push('resolved');
+    if (fields.length) {
+      addChange({
+        kind: 'annotation', op: 'change', fields,
+        from: annoSlim(old), to: annoSlim(a),
+        cells: sortCellList([old.cell, a.cell])
+      });
+    }
+  }
+  for (const a of from.annotations) {
+    if (!toAnno.has(a.id)) {
+      addChange({ kind: 'annotation', op: 'remove', from: annoSlim(a), to: null, cells: [a.cell] });
+    }
+  }
+
+  // —— 爬移补偿独立字段（存在性 / 参数 / 逐面偏移）——
+  const cf = from.creepCompensation || null;
+  const ct = to.creepCompensation || null;
+  if (cf || ct) {
+    const creepKeys = new Set([
+      ...Object.keys((cf && cf.faces) || {}),
+      ...Object.keys((ct && ct.faces) || {})
+    ]);
+    const changedCells = [];
+    for (const k of creepKeys) {
+      const a = cf && cf.faces[k], b = ct && ct.faces[k];
+      if (!a || !b || Number(a.front) !== Number(b.front) || Number(a.back) !== Number(b.back)) {
+        changedCells.push(k);
+      }
+    }
+    const sameSummary = cf && ct
+      && JSON.stringify(cf.params || {}) === JSON.stringify(ct.params || {})
+      && Number(cf.maxCompensation || 0) === Number(ct.maxCompensation || 0);
+    if (!cf || !ct || !sameSummary || changedCells.length) {
+      addChange({
+        kind: 'creep',
+        op: !cf ? 'add' : !ct ? 'remove' : 'change',
+        from: cf ? {
+          params: cf.params || null,
+          maxCompensation: cf.maxCompensation != null ? cf.maxCompensation : null,
+          faceCount: Object.keys(cf.faces || {}).length
+        } : null,
+        to: ct ? {
+          params: ct.params || null,
+          maxCompensation: ct.maxCompensation != null ? ct.maxCompensation : null,
+          faceCount: Object.keys(ct.faces || {}).length
+        } : null,
+        changedCells: sortCellList(changedCells),
+        cells: sortCellList([...creepKeys])
+      });
+    }
+  }
+
+  // —— 末态几何：折叠步骤/网格变化导致的原始纸格终态差异（位置/层序/朝向）——
+  const layF = terminalLayout(from);
+  const layT = terminalLayout(to);
+  for (let y = 0; y < Math.min(from.rows, to.rows); y++) {
+    for (let x = 0; x < Math.min(from.cols, to.cols); x++) {
+      const id = `${x},${y}`;
+      const a = layF.map[id], b = layT.map[id];
+      if (!a || !b) continue;
+      if (a.at !== b.at || a.layer !== b.layer || a.frame !== b.frame) affected.add(id);
+    }
+  }
+
+  const affectedCells = sortCellList([...affected]);
+  return {
+    ok: true,
+    gridSize: {
+      from: { rows: from.rows, cols: from.cols },
+      to: { rows: to.rows, cols: to.cols }
+    },
+    geometryInterrupted: { from: layF.error, to: layT.error },
+    changes,
+    affectedCells,
+    summary: {
+      total: changes.length,
+      adds: counts.add,
+      removes: counts.remove,
+      changes: counts.change,
+      affectedCells: affectedCells.length,
+      byKind
+    }
+  };
+}
+
 /** 方案校验/规整（载入 JSON 时使用） */
 function normalizePlan(plan) {
   const errors = [];
@@ -1629,7 +1916,8 @@ const api = {
   trackPanel, auditPlan,
   normalizePlanMeta, coercePlanMeta, MetaError, META_LIMITS,
   normalizeAnnotations, coerceAnnotations, annotationStats, locateAnnotations,
-  AnnotationError, ANNO_LIMITS, ANNO_SEVERITIES, newAnnotationId
+  AnnotationError, ANNO_LIMITS, ANNO_SEVERITIES, newAnnotationId,
+  diffPlans
 };
 
 if (typeof module !== 'undefined' && module.exports) module.exports = api;

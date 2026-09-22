@@ -37,6 +37,17 @@
 > 随方案**保存 / 导出 / 导入**（保存严格校验整请求拒绝，导入宽容规整逐条丢弃坏数据），
 > 并可通过只读接口 `POST /api/annotations/locate` 脚本化定位。
 
+> **版本差异审阅**（新增）：服务端对**每次成功保存**保留一份**不可变方案快照**
+> （`<id>.versions/v000006.json`，只追加、永不原地改写）。右侧“版本差异审阅”卡片可
+> 选择同一方案的**两个版本**比较：以**原始纸格**与**步骤序号**为稳定身份，列出
+> 正/反页码、折叠步骤、标签/备注、校样批注与爬移补偿的**增 / 删 / 改**，并在画布以
+> **紫色描边高亮全部受影响纸格**（夹在叠中时按层偏移描边）；点差异行的
+> “在 vN 查看”即载入该版本进入**只读审阅**并联动回放到对应步骤/纸格/批注。
+> 可把任一历史版本**恢复为当前草稿**（恢复前确认；历史快照不覆盖、不删除，
+> 下次保存另起新版本并标记 `reason:"restore"` 与来源版本），恢复后继续沿用现有
+> 回放、审计与保存流程。审阅模式下全部编辑控件锁定，回放 / 轨迹 / 审计 / 双面版预览
+> 等只读能力照常使用。
+
 ---
 
 ## 一条命令启动
@@ -201,6 +212,31 @@ docker compose down
      顶部提示“筛选命中 N / 总数 M 个存档”；点“清除筛选”恢复全部存档；
    - 非法标签 / 过长输入在前端与服务端**双重拦截**：保存被整请求拒绝，
      服务器上的旧存档**保持不变**（更新时间也不会变化）。
+14. **版本差异审阅**：右侧“版本差异审阅”卡片在方案保存到服务器后可用：
+    - **不可变快照**：每次点“保存到服务器”成功，服务端都会把本次方案完整写入
+      一个只追加的版本文件（v1、v2、…）；之后无论怎样修改、再次保存，旧版本文件
+      都不会被改动。删除方案时才会连带删除全部历史版本。
+    - **比较两个版本**：在“版本 A（旧）/ 版本 B（新）”下拉中选择同一方案的两个
+      版本（保存后默认选中最近两个），点“比较版本”。系统以
+      **原始纸格坐标 + 面别**（页码）、**步骤序号**（折叠步骤）、**批注 id** 为稳定
+      身份，分段列出：网格尺寸、标签/备注/名称、折叠步骤、正/反页码、校样批注、
+      爬移补偿的**新增 / 删除 / 修改**，并给出每项的旧值 → 新值与受影响原始纸格；
+      顶部汇总各类条数与受影响纸格总数。纯标签顺序调整不报差异；版本之一含非法折叠时
+      几何比对按截断态进行并提示。
+    - **画布高亮**：比较后画布以**紫色虚线描边**标出所有受影响原始纸格（折叠改动的
+      移动瓣、页码/批注所在格、以及末态位置/层序/朝向发生变化的纸格）；点击差异聚焦时
+      对应纸格改为**加粗实色紫框**。右侧折叠步骤列表中差异步骤标注“增 / 删 / 改”。
+    - **联动回放**：每条差异提供“在 vA 查看 / 在 vB 查看”按钮（新增项仅新版本可看、
+      删除项仅旧版本可看）。点击后载入该版本进入**只读审阅**，自动定位：折叠步骤跳到
+      对应步骤序号；页码差异跳到末态并高亮该原格；批注差异跳到批注创建步并选中该批注。
+      审阅模式顶部显示紫色横幅，画布上可继续点击纸格反查差异；顶部回放条、面片轨迹、
+      生产质量审计、双面印刷版预览等只读功能照常工作，全部编辑入口锁定。
+    - **恢复历史版本**：审阅横幅中点“恢复为当前草稿…”，确认后该历史版本内容成为
+      **当前草稿**并退出版阅：**历史快照不覆盖、不删除**；“返回当前草稿”则放弃查看、
+      还原进入审阅前的草稿。恢复得到的草稿沿用现有保存流程——下一次“保存到服务器”
+      会**追加一个新版本**（版本列表中标注“恢复自 vN”），随后可继续重放、审计与编辑。
+    - 审阅中的历史版本不能直接保存/导出/编辑；导入 JSON、新建网格、删除存档等操作
+      在审阅期间也会被拦截，避免误改。
 
 ### 方案 JSON 格式
 
@@ -281,6 +317,30 @@ docker compose down
 - `basis.stepsSignature` 为应用时的网格+折叠步骤签名，载入后用于识别方案是否已过期；
 - 载入时该字段仅做结构规整（非法静默丢弃），不影响方案其余部分。
 
+### 不可变版本快照存储格式
+
+每次成功保存（`POST /api/plans`）后，服务端在数据卷追加一个版本快照
+`DATA_DIR/<id>.versions/v000006.json`（6 位零填序号，从 v1 起，临时文件 + rename 原子写入）：
+
+```json
+{
+  "version": 6,
+  "planId": "ab12cd34ef56",
+  "reason": "save",
+  "restoredFromVersion": null,
+  "savedAt": "2026-09-22T05:10:00.000Z",
+  "plan": { "name": "8页折帖", "rows": 2, "cols": 2, "…": "当时保存的完整方案 JSON" }
+}
+```
+
+- 快照**只追加、永不原地改写**：再次保存只新增更高序号文件；`reason` 为 `restore` 时
+  带 `restoredFromVersion`（恢复来源版本号）。
+- 快照文件不会被 `GET /api/plans` 列表扫描（仅识别 DATA_DIR 顶层 `*.json`）；
+  方案文件删除时其 `<id>.versions/` 目录一并删除。
+- 快照中的 `plan` 与方案文件格式一致，`GET /api/plans/:id/versions/:version`
+  原样返回；浏览器端的差异计算（`FoldEngine.diffPlans`）与服务端
+  `GET /api/plans/:id/diff` 使用同一份共用引擎代码。
+
 ---
 
 ## 折叠模型
@@ -298,13 +358,13 @@ docker compose down
 ## 目录结构
 
 ```
-server.js              Express 服务：静态托管 + /api/simulate + /api/impose + /api/duplex-plate + /api/find-path + /api/trajectory + /api/audit + /api/creep-compensation + /api/annotations/locate + 方案持久化（标签/备注/校样批注/列表筛选）
-entrypoint.sh          容器启动入口（依赖自检/安装、引擎与批注规整自检、初始化、启动）
+server.js              Express 服务：静态托管 + /api/simulate + /api/impose + /api/duplex-plate + /api/find-path + /api/trajectory + /api/audit + /api/creep-compensation + /api/annotations/locate + 方案持久化（标签/备注/校样批注/列表筛选）+ 不可变版本快照与 /api/plans/:id/versions(/:version|/diff)
+entrypoint.sh          容器启动入口（依赖自检/安装、引擎与批注规整/版本差异自检、初始化、启动）
 public/
-  index.html           页面结构（含标签/备注编辑、存档筛选条与校样批注卡片/弹层）
-  styles.css           样式（含标签 chips、存档筛选、面片轨迹时间线、审计卡片、爬移补偿表、校样批注标记/列表与双面版打印样式 @media print）
-  foldEngine.js        折叠模拟引擎（浏览器与服务端共用，含面片轨迹 trackPanel、生产质量审计 auditPlan、书帖爬移补偿 creepCompensation、标签/备注规范化 normalizePlanMeta/coercePlanMeta、校样批注 normalizeAnnotations/coerceAnnotations/annotationStats/locateAnnotations）
-  app.js               Canvas 渲染、交互、回放、面片轨迹、存取（标签编辑/列表筛选）、双面印刷版预览、生产质量审计、书帖爬移补偿、校样批注（增删改/解决恢复/筛选/面片身份标记）
+  index.html           页面结构（含标签/备注编辑、存档筛选条、校样批注卡片/弹层与版本差异审阅卡片/审阅横幅）
+  styles.css           样式（含标签 chips、存档筛选、面片轨迹时间线、审计卡片、爬移补偿表、校样批注标记/列表、版本差异列表/审阅横幅/画布紫框与双面版打印样式 @media print）
+  foldEngine.js        折叠模拟引擎（浏览器与服务端共用，含面片轨迹 trackPanel、生产质量审计 auditPlan、书帖爬移补偿 creepCompensation、标签/备注规范化 normalizePlanMeta/coercePlanMeta、校样批注 normalizeAnnotations/coerceAnnotations/annotationStats/locateAnnotations、版本差异 diffPlans）
+  app.js               Canvas 渲染、交互、回放、面片轨迹、存取（标签编辑/列表筛选）、双面印刷版预览、生产质量审计、书帖爬移补偿、校样批注（增删改/解决恢复/筛选/面片身份标记）、版本差异审阅（版本列表/双版本比较/只读审阅锁定/差异联动回放/恢复草稿）
 tests/engine.test.js   引擎单元测试（node --test）
 tests/meta.test.js     方案标签/备注/名称规范化（严格保存、宽容导入、码点计数）单元测试
 tests/annotations.test.js 校样批注（严格/宽容规整、错误码、统计、跨回放步与重排折叠的面片身份定位、非法步截断）单元测试
@@ -318,6 +378,8 @@ tests/trajectory.test.js 面片轨迹（身份追踪、层序/朝向、非法步
 tests/audit.test.js    生产质量审计（分级结论、空白/重复/倒置/未覆盖/容量、非法步中止）单元测试
 tests/creep.test.js    书帖爬移补偿（层序、书脊方向、标架换算、出血标红、字段规整）单元测试
 tests/tags.test.js     方案存档（标签规范化持久化、非法整请求 400 且不改旧档、标签交集/关键词/时间筛选、稳定排序与匹配计数、旧档兼容）HTTP 测试
+tests/versions.http.test.js 版本快照（每次保存追加不可变快照、版本列表/快照/差异接口、恢复标记 reason=restore、非法保存不产版本、删方案连带删除版本、列表 versions 计数）HTTP 测试
+tests/diff.test.js     版本差异（原格+面别/步骤序号/批注 id 稳定身份、增删改分类、受影响纸格并集、网格/标签/爬移/非法折叠截断）单元测试
 tests/api.test.js      /api/impose、/api/find-path、/api/trajectory、/api/audit、/api/creep-compensation、/api/simulate 与方案存取的 HTTP 测试
 tests/ui-smoke.js      前端主流程冒烟（DOM 桩中加载 app.js，含标签编辑与筛选请求，直接 `node tests/ui-smoke.js` 运行）
 Dockerfile, docker-compose.yml
@@ -418,6 +480,90 @@ node tests/ui-smoke.js   # 前端主流程冒烟（DOM 桩，独立运行）
 方案含非法折叠时返回 `ok:false` 与首个错误（`code` / `stepIndex` / `conflicts`），
 不附带任何后续检查结论；网格非法为 `bad_grid`，方案 JSON 非法为 `bad_plan`（HTTP 400）。
 该接口只读，不改动方案与存档。
+
+`POST /api/plans` 成功响应额外带 `version`（本次保存产生的不可变快照版本号）与
+`savedAt`。方案存档删除（`DELETE /api/plans/:id`）时其版本目录一并删除；
+`GET /api/plans` 列表每项新增 `versions`（该存档的不可变版本数）。
+
+### 版本差异审阅接口（只读；快照仅在成功保存时追加）
+
+`GET /api/plans/:id/versions` 返回某方案的全部不可变版本（序号升序）：
+
+```json
+{
+  "ok": true, "id": "ab12cd34ef56", "latest": 3,
+  "versions": [
+    { "version": 1, "planId": "ab12cd34ef56", "name": "8页折帖",
+      "rows": 2, "cols": 2, "steps": 1, "tags": [], "note": "",
+      "annotations": 0, "openAnnotations": 0, "hasCreep": false,
+      "savedAt": "…", "reason": "save", "restoredFromVersion": null }
+  ]
+}
+```
+
+- 摘要不含完整 `labels` / `steps`；`reason` 为 `save`（常规保存）或
+  `restore`（由恢复历史版本后保存产生，此时 `restoredFromVersion` 为来源版本号）。
+
+`GET /api/plans/:id/versions/:version` 返回单个版本的完整快照：
+`{ ok, version, reason, restoredFromVersion, savedAt, plan }`，`plan` 即当时保存的
+完整方案 JSON（标签 / 备注 / 批注 / 爬移补偿齐全）。版本号非正整数 → `400 bad_version`；
+版本不存在 → `404 version_not_found`；方案不存在 → `404 not_found`。
+
+`GET /api/plans/:id/diff?from=A&to=B` 以**原始纸格与步骤序号**为稳定身份比较两个版本：
+
+```json
+{
+  "ok": true, "id": "…",
+  "from": { "version": 1, "savedAt": "…" },
+  "to":   { "version": 2, "savedAt": "…" },
+  "diff": {
+    "gridSize": { "from": {"rows":1,"cols":2}, "to": {"rows":2,"cols":2} },
+    "geometryInterrupted": { "from": null, "to": null },
+    "changes": [
+      { "kind": "step", "index": 1, "op": "add",
+        "from": null, "to": {"axis":"h","line":1,"dir":"d"},
+        "fromText": null, "toText": "横线 1，▼ 向下折",
+        "fromCells": [], "toCells": ["0,0","1,0"],
+        "fromInvalid": false, "toInvalid": false,
+        "cells": ["0,0","1,0"] },
+      { "kind": "label", "cell": "0,0", "face": "back", "op": "add",
+        "from": "", "to": "2",
+        "outOfGridFrom": false, "outOfGridTo": false, "cells": ["0,0"] },
+      { "kind": "annotation", "op": "change", "fields": ["severity"],
+        "from": { "id": "a…", "cell": "0,0", "face": "front",
+                  "severity": "error", "text": "套印偏差", "resolved": false, "step": 1 },
+        "to":   { "id": "a…", "cell": "0,0", "face": "front",
+                  "severity": "warning", "text": "套印偏差", "resolved": false, "step": 1 },
+        "cells": ["0,0"] }
+    ],
+    "affectedCells": ["0,0", "1,0"],
+    "summary": { "total": 3, "adds": 2, "removes": 0, "changes": 1,
+                 "affectedCells": 2,
+                 "byKind": {"grid":0,"meta":0,"step":1,"label":1,"annotation":1,"creep":0} }
+  }
+}
+```
+
+- `changes` 按 `grid → meta → step → label → annotation → creep` 稳定排序，
+  每条 `op` 为 `add` / `remove` / `change`，`cells` 为关联原始纸格（供画布高亮）；
+  - `grid`：网格尺寸变化，带 `from/fromCells`、`to/toCells`（两侧独有纸格）；
+  - `meta`：`field` 为 `name` / `note` / `tags`（标签按集合差，纯重排不报）；
+  - `step`：稳定身份是**步骤序号**（0 基 `index`），`fromCells/toCells` 为该步执行前
+    移动侧（或非法步冲突侧）的原始纸格；
+  - `label`：稳定身份是**原格 + 面别**，`from/to` 为页码字符串（空串=空白，
+    `null`=该版本网格不含此格）；一侧越界另一侧空白的情况只在 `grid` 条报差异；
+  - `annotation`：稳定身份是**批注 id**；仅创建步 `step` 变化不报差异；
+  - `creep`：爬移补偿存在性 / 参数 / 逐面偏移变化，`changedCells` 列出偏移变化纸格。
+- `affectedCells` 为全部条目的纸格并集，再并入“末态格位 / 叠内层序 / 面片朝向”
+  经完整重放后不同的原始纸格（按先行后列排序）；
+- `geometryInterrupted.from/to` 在该版本含非法折叠时给出
+  `{ stepIndex, code, conflicts }`，几何比对按截断态进行，差异仍完整返回；
+- `from`/`to` 非正整数 → `400 bad_version`；任一版本不存在 → `404 version_not_found`；
+  方案不存在 → `404 not_found`；`id` 非法 → `400 bad_id`。接口只读，不产生快照。
+
+快照物理存储于数据卷 `DATA_DIR`：`/app/data/<id>.json` 为当前方案，
+`/app/data/<id>.versions/v000001.json …` 为不可变快照（临时文件 + rename 原子写入），
+Docker Compose 命名卷 `fold-data` 同时覆盖二者，容器重建历史不丢。
 
 ### 方案存档接口（标签 / 备注 / 筛选）
 

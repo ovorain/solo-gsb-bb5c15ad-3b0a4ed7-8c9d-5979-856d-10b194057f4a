@@ -73,7 +73,10 @@ const ids = ['rowsInput', 'colsInput', 'createGridBtn', 'axisSelect', 'lineSelec
   'annotationCard', 'annoOpenOnly', 'annoSeverityFilter', 'annoFaceFilter',
   'annoStatus', 'annoList', 'annoEditor', 'annoEditorTarget', 'annoEditorMeta',
   'annoSeverity', 'annoStepText', 'annoText', 'annoCharHint', 'annoEditorMsg',
-  'annoDeleteBtn', 'annoCancelBtn', 'annoSaveBtn'];
+  'annoDeleteBtn', 'annoCancelBtn', 'annoSaveBtn',
+  'versionCard', 'reviewBanner', 'reviewBannerText', 'reviewExitBtn',
+  'reviewRestoreBtn', 'reviewVersionsBtn', 'diffFrom', 'diffTo', 'diffBtn',
+  'versionStatus', 'diffSummary', 'diffList', 'diffLegend'];
 const els = Object.fromEntries(ids.map((id) => [id, makeEl(id)]));
 els.rowsInput.value = '2';
 els.colsInput.value = '2';
@@ -92,25 +95,79 @@ const foldBtns = ['l', 'r', 'u', 'd'].map((dir) => {
 
 // 存档存储桩：记录 POST 载荷与列表筛选查询，供标签/筛选流程断言
 const planStore = new Map();
+const versionStore = new Map();   // id -> [快照信封...]
 const fetchCalls = [];
 function makeJsonResponse(obj, status = 200) {
   return { status, ok: status >= 200 && status < 300, json: async () => obj };
 }
 async function stubFetch(url, opts = {}) {
   fetchCalls.push({ url, method: opts.method || 'GET', body: opts.body ? JSON.parse(opts.body) : null });
-  if (url === '/api/plans' && (opts.method || 'GET') === 'POST') {
+  const method = opts.method || 'GET';
+  // —— 不可变版本快照接口 ——
+  let m;
+  if (method === 'POST' && url === '/api/plans') {
     const body = JSON.parse(opts.body);
-    planStore.set(body.id || 'auto-' + planStore.size, body);
-    return makeJsonResponse({ ok: true, id: body.id || 'id1', plan: body });
+    const id = body.id || ('auto-' + planStore.size);
+    planStore.set(id, body);
+    const list = versionStore.get(id) || [];
+    const snap = {
+      version: list.length + 1, planId: id,
+      reason: body.restoredFromVersion ? 'restore' : 'save',
+      restoredFromVersion: body.restoredFromVersion || null,
+      savedAt: new Date().toISOString(),
+      plan: { ...body, id: undefined, restoredFromVersion: undefined }
+    };
+    list.push(snap);
+    versionStore.set(id, list);
+    return makeJsonResponse({ ok: true, id, version: snap.version, savedAt: snap.savedAt, plan: body });
   }
-  if (url.startsWith('/api/plans') && (opts.method || 'GET') === 'GET') {
+  if ((m = /^\/api\/plans\/([^/]+)\/versions$/.exec(url)) && method === 'GET') {
+    const list = versionStore.get(m[1]) || [];
+    return makeJsonResponse({
+      ok: true, id: m[1], latest: list.length,
+      versions: list.map((s) => ({
+        version: s.version, planId: s.planId, name: s.plan.name,
+        rows: s.plan.rows, cols: s.plan.cols, steps: s.plan.steps.length,
+        tags: s.plan.tags || [], note: s.plan.note || '',
+        annotations: (s.plan.annotations || []).length, openAnnotations: 0,
+        hasCreep: !!s.plan.creepCompensation,
+        savedAt: s.savedAt, reason: s.reason, restoredFromVersion: s.restoredFromVersion
+      }))
+    });
+  }
+  if ((m = /^\/api\/plans\/([^/]+)\/versions\/(\d+)$/.exec(url)) && method === 'GET') {
+    const list = versionStore.get(m[1]) || [];
+    const snap = list[Number(m[2]) - 1];
+    return snap ? makeJsonResponse({ ok: true, version: snap.version, reason: snap.reason,
+      restoredFromVersion: snap.restoredFromVersion, savedAt: snap.savedAt, plan: snap.plan })
+      : makeJsonResponse({ ok: false, error: { code: 'version_not_found', message: 'no' } }, 404);
+  }
+  if ((m = /^\/api\/plans\/([^/]+)\/diff\?from=(\d+)&to=(\d+)$/.exec(url)) && method === 'GET') {
+    const list = versionStore.get(m[1]) || [];
+    const sf = list[Number(m[2]) - 1], st = list[Number(m[3]) - 1];
+    if (!sf || !st) return makeJsonResponse({ ok: false, error: { code: 'version_not_found' } }, 404);
+    return makeJsonResponse({
+      ok: true, id: m[1],
+      from: { version: sf.version, savedAt: sf.savedAt },
+      to: { version: st.version, savedAt: st.savedAt },
+      diff: FE.diffPlans(sf.plan, st.plan)
+    });
+  }
+  if (url.startsWith('/api/plans') && method === 'GET') {
     const qIndex = url.indexOf('?');
     const params = new URLSearchParams(qIndex >= 0 ? url.slice(qIndex + 1) : '');
     const items = [...planStore.entries()].map(([id, p]) => ({
       id, name: p.name, rows: p.rows, cols: p.cols, steps: p.steps.length,
-      tags: p.tags || [], note: p.note || '', updatedAt: '2026-09-22T00:00:00.000Z'
+      tags: p.tags || [], note: p.note || '', updatedAt: '2026-09-22T00:00:00.000Z',
+      versions: (versionStore.get(id) || []).length
     }));
     return makeJsonResponse({ total: items.length, matched: items.length, items, allTags: [] });
+  }
+  if (url.startsWith('/api/plans') && method === 'DELETE') {
+    const id = url.split('/').pop();
+    planStore.delete(id);
+    versionStore.delete(id);
+    return makeJsonResponse({ ok: true });
   }
   return { json: async () => ({ ok: false }) };
 }
@@ -717,8 +774,9 @@ els.planList.hidden = true;   // 避免保存成功后自动刷新列表干扰 f
 els.saveBtn.dispatch('click');
 (async () => {
   await new Promise((r) => setTimeout(r, 0));
-  const saveCall = fetchCalls[fetchCalls.length - 1];
-  assert.equal(saveCall.method, 'POST');
+  // 保存成功后会自动追加一次版本列表 GET，故倒序查找保存 POST
+  const saveCall = [...fetchCalls].reverse().find((c) => c.method === 'POST' && c.url === '/api/plans');
+  assert.ok(saveCall, '应发出保存 POST');
   assert.deepEqual(saveCall.body.tags, payload.tags);
   assert.equal(saveCall.body.note, '用于首件确认');
 
@@ -738,7 +796,8 @@ els.saveBtn.dispatch('click');
   els.filterSince.value = '86400000';
   els.filterApplyBtn.dispatch('click');
   await new Promise((r) => setTimeout(r, 0));
-  const listCall = fetchCalls[fetchCalls.length - 1];
+  const listCall = [...fetchCalls].reverse().find((c) => /\/api\/plans\?tags=/.test(c.url));
+  assert.ok(listCall, '应发出带筛选参数的列表请求');
   assert.match(listCall.url, /tags=/);
   assert.match(listCall.url, /q=/);
   assert.match(listCall.url, /since=/);
@@ -748,7 +807,7 @@ els.saveBtn.dispatch('click');
   // 清除筛选：再次拉取不带 query
   els.filterResetBtn.dispatch('click');
   await new Promise((r) => setTimeout(r, 0));
-  const resetCall = fetchCalls[fetchCalls.length - 1];
+  const resetCall = [...fetchCalls].reverse().find((c) => c.url === '/api/plans');
   assert.equal(resetCall.url, '/api/plans');
   assert.deepEqual(ui.listFilter, { tags: '', q: '', since: '' });
 
@@ -889,8 +948,8 @@ els.saveBtn.dispatch('click');
   els.planList.hidden = true;
   els.saveBtn.dispatch('click');
   await new Promise((r) => setTimeout(r, 0));
-  const annoSaveCall = fetchCalls[fetchCalls.length - 1];
-  assert.equal(annoSaveCall.method, 'POST');
+  const annoSaveCall = [...fetchCalls].reverse().find((c) => c.method === 'POST' && c.url === '/api/plans');
+  assert.ok(annoSaveCall, '应发出保存 POST');
   assert.equal(annoSaveCall.body.annotations.length, 1);
 
   // 新建网格清空批注
@@ -919,6 +978,127 @@ els.saveBtn.dispatch('click');
   // 载入后标记按末态定位
   marks = ui.currentAnnotationMarks(ui.replay.state);
   assert.deepEqual([...marks.keys()], ['1,1']);
+
+  // ---------- 版本差异审阅 ----------
+  // 干净 2×2，保存为服务器存档 v1
+  els.rowsInput.value = '2'; els.colsInput.value = '2';
+  els.createGridBtn.dispatch('click');
+  ui.plan.steps = [{ axis: 'v', line: 1, dir: 'r' }];
+  ui.plan.name = '版本冒烟';
+  ui.loadedId = 'ver-smoke';
+  ui.render();
+  els.planList.hidden = true;
+  els.saveBtn.dispatch('click');
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(ui.loadedId, 'ver-smoke');
+  let verList = await (await stubFetch(`/api/plans/${ui.loadedId}/versions`)).json();
+  assert.equal(verList.latest, 1, '首次保存生成 v1');
+
+  // 修改：加第二步 + 改页码 + 加批注 → 保存为 v2
+  ui.plan.steps = [
+    { axis: 'v', line: 1, dir: 'r' },
+    { axis: 'h', line: 1, dir: 'd' }
+  ];
+  ui.plan.labels = { '0,0': { front: '4', back: '5' } };
+  ui.setUpto(2, true);
+  els.saveBtn.dispatch('click');
+  await new Promise((r) => setTimeout(r, 0));
+  verList = await (await stubFetch(`/api/plans/${ui.loadedId}/versions`)).json();
+  assert.deepEqual(verList.versions.map((v) => v.version), [1, 2]);
+  assert.equal(els.reviewVersionsBtn.hidden, false, '有版本后“版本列表…”按钮可见');
+  // 保存后默认选中最近两个版本
+  assert.equal(els.diffFrom.value, '1');
+  assert.equal(els.diffTo.value, '2');
+  assert.equal(els.diffBtn.disabled, false);
+
+  // 不可变性：v1 快照仍是 1 步、无标注
+  const v1snap = await (await stubFetch(`/api/plans/${ui.loadedId}/versions/1`)).json();
+  assert.equal(v1snap.plan.steps.length, 1);
+  assert.deepEqual(v1snap.plan.labels, {});
+
+  // 比较 v1 → v2
+  els.diffBtn.dispatch('click');
+  await new Promise((r) => setTimeout(r, 0));
+  assert.ok(ui.versions.diff, '差异结果已生成');
+  assert.equal(ui.versions.diff.fromV, 1);
+  assert.equal(ui.versions.diff.toV, 2);
+  const d = ui.versions.diff.diff;
+  assert.ok(d.changes.some((c) => c.kind === 'step' && c.op === 'add' && c.index === 1));
+  assert.ok(d.changes.some((c) => c.kind === 'label'));
+  assert.ok(d.affectedCells.includes('0,0'));
+  assert.equal(els.diffList.hidden, false);
+  assert.ok(/共/.test(els.diffSummary.textContent));
+
+  // 比较后进入较新版本只读审阅：当前草稿被压栈、编辑控件锁定
+  assert.ok(ui.versions.review, '自动进入 v2 只读审阅');
+  assert.equal(ui.versions.review.version, 2);
+  assert.equal(els.reviewBanner.hidden, false);
+  assert.equal(els.saveBtn.disabled, true, '审阅模式禁止保存');
+  assert.equal(els.createGridBtn.disabled, true);
+  assert.equal(ui.reviewGuard(), true, 'reviewGuard 在审阅中拦截');
+
+  // 画布差异标记：受影响原格映射到当前版本格位
+  const diffMarks = ui.currentDiffMarks(ui.replay.state);
+  assert.ok(diffMarks, '审阅中存在差异标记');
+  assert.ok(diffMarks.affectedOriginByCell.size > 0);
+
+  // 审阅中变更操作全部被拦截
+  const stepsBefore = ui.plan.steps.length;
+  ui.requestStep({ axis: 'v', line: 1, dir: 'r' });
+  assert.equal(ui.plan.steps.length, stepsBefore, '审阅中不可追加步骤');
+  ui.previewImposition();
+  assert.equal(ui.imposition.result, null, '审阅中不可拼版');
+  ui.applyCreep();
+  assert.equal(ui.plan.creepCompensation, undefined, '审阅中不可应用爬移');
+  ui.openAnnotationEditor('0,0', 'front');
+  assert.equal(els.annoEditor.hidden, true, '审阅中批注弹层不打开');
+
+  // 回放仍可用，且不退出审阅
+  ui.setUpto(0, true);
+  assert.equal(ui.upto, 0);
+  assert.ok(ui.versions.review);
+
+  // 点击“在 v1 查看”某条步骤差异：载入 v1 审阅、定位到差异步（新增步在旧侧定位到第 1 步）
+  const stepIdx = d.changes.findIndex((c) => c.kind === 'step' && c.op === 'add');
+  await ui.viewChangeAt(stepIdx, 1);
+  assert.equal(ui.versions.review.version, 1);
+  assert.equal(ui.plan.steps.length, 1, '画布切换为 v1 内容');
+  // 草稿仍安全保存在栈中
+  assert.equal(ui.versions.review.stash.plan.steps.length, 2);
+
+  // 恢复（桩 confirm 返回 true）：v1 成为草稿，退出审阅；历史不删除
+  sandbox.confirm = () => true;
+  ui.restoreReviewedVersion();
+  assert.equal(ui.versions.review, null, '恢复后退出审阅');
+  assert.equal(ui.plan.steps.length, 1, '草稿内容为 v1');
+  assert.equal(ui.versions.restoreMarker, 1, '首次保存携带恢复来源版本号');
+  assert.equal(els.reviewBanner.hidden, true);
+  assert.equal(els.saveBtn.disabled, false, '退出审阅后控件恢复');
+  // 再保存：产生 v3，reason=restore；v1/v2 保留
+  els.saveBtn.dispatch('click');
+  await new Promise((r) => setTimeout(r, 0));
+  verList = await (await stubFetch(`/api/plans/${ui.loadedId}/versions`)).json();
+  assert.deepEqual(verList.versions.map((v) => v.version), [1, 2, 3]);
+  assert.equal(verList.versions[2].reason, 'restore');
+  assert.equal(verList.versions[2].restoredFromVersion, 1);
+  assert.equal(ui.versions.restoreMarker, null, '保存后恢复标记清除');
+
+  // “返回当前草稿”路径：进入 v2 审阅后退出，草稿还原
+  els.diffFrom.value = '1'; els.diffTo.value = '2';
+  els.diffBtn.dispatch('click');
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(ui.versions.review.version, 2);
+  ui.exitReview();
+  assert.equal(ui.versions.review, null);
+  assert.equal(ui.plan.steps.length, 1, '返回的是恢复保存后的草稿（v1 内容）');
+
+  // 删除存档：版本状态重置
+  sandbox.confirm = () => true;
+  els.deletePlanBtn.dispatch('click');
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(ui.versions.list, null);
+  assert.equal(els.reviewVersionsBtn.hidden, true);
+  sandbox.confirm = () => false;
 
   console.log('前端冒烟流程全部通过');
 })();

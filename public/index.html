@@ -118,6 +118,7 @@
           <span><i class="swatch conflict"></i>冲突纸格</span>
           <span><i class="swatch track"></i>追踪面片</span>
           <span><i class="swatch anno"></i>批注标记</span>
+          <span id="diffLegend" hidden><i class="swatch diff"></i>差异纸格</span>
           <span id="statusBadge" class="badge"></span>
         </div>
       </div>
@@ -156,6 +157,33 @@
         </div>
         <div id="trackStatus" class="hint"></div>
         <div id="trackTimeline" class="track-timeline" hidden></div>
+      </section>
+
+      <section class="card" id="versionCard">
+        <h2>版本差异审阅</h2>
+        <p class="hint">每次<b>成功保存</b>都会在服务器保留一份不可变版本快照。选择同一方案的两个版本比较：
+          以<b>原始纸格</b>与<b>步骤序号</b>为稳定身份，列出正/反页码、折叠步骤、标签备注与校样批注的
+          增删改，并在画布紫色高亮受影响纸格；点击差异行可回放对应版本。历史版本可恢复为当前草稿。</p>
+        <div id="reviewBanner" class="review-banner" hidden>
+          <div id="reviewBannerText" class="review-banner-text"></div>
+          <div class="row">
+            <button id="reviewExitBtn" class="primary">返回当前草稿</button>
+            <button id="reviewRestoreBtn">恢复为当前草稿…</button>
+          </div>
+        </div>
+        <div class="row">
+          <label>版本 A（旧）
+            <select id="diffFrom"><option value="">—</option></select>
+          </label>
+          <label>版本 B（新）
+            <select id="diffTo"><option value="">—</option></select>
+          </label>
+          <button id="diffBtn" class="primary" disabled>比较版本</button>
+          <button id="reviewVersionsBtn" hidden>版本列表…</button>
+        </div>
+        <div id="versionStatus" class="hint">保存方案到服务器后即可比较历史版本。</div>
+        <div id="diffSummary" class="diff-summary" hidden></div>
+        <div id="diffList" class="diff-list" hidden></div>
       </section>
 
       <section class="card" id="annotationCard">
