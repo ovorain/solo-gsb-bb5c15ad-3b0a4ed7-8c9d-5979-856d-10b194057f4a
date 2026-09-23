@@ -1562,6 +1562,260 @@ function locateAnnotations(rows, cols, labels, steps, upto, annotations) {
   return { ok: true, upto, interrupted: r.error, points };
 }
 
+// ---------- 版本差异 ----------
+/**
+ * 版本差异审阅
+ * ------------
+ * 以两类<b>稳定身份</b>对齐同一方案的两个历史快照（见服务端版本快照）：
+ *   - 原始纸格坐标 "x,y"：正反页码（labels）与校样批注的归属；
+ *   - 步骤序号（0 基数组下标）：折叠步骤的身份。
+ * 注意：在中间插入/删除步骤会使之后的序号整体平移，序号之后的步骤会如实
+ * 显示为“改/增/删”——序号即约定身份，不做 LCS 模糊对齐。
+ *
+ * 批注以其 id 为身份，对比 cell/face/severity/text/step/resolved 六个字段
+ * （createdAt/resolvedAt 为操作元数据，不参与差异）。
+ *
+ * @returns {
+ *   ok:true,
+ *   grid: null | { from:{rows,cols}, to:{rows,cols} },
+ *   meta: [{ kind:'add'|'remove'|'modify', field:'name'|'note'|'tag', from?, to?, value? }],
+ *   labels: [{ kind, cell, face:'front'|'back', from:string, to:string }],   // '' = 空白面
+ *   steps: [{ kind, index, from:step|null, to:step|null,
+ *             fromText?:string, toText?:string, fromCells:[origins], toCells:[origins] }],
+ *   annotations: [{ kind, id, cell, face, fields:[{field,from,to}], from:rec|null, to:rec|null }],
+ *   affectedCells: string[],   // 全部受影响原始纸格（用于画布高亮）
+ *   removedCells: string[],    // 不在新版本网格内、无法在新画布上高亮的旧纸格
+ *   summary: { labels:{add,remove,modify}, steps:{...}, annotations:{...}, meta:number, total:number }
+ * }
+ */
+function diffPlans(fromRaw, toRaw) {
+  const a = (fromRaw && typeof fromRaw === 'object' && !Array.isArray(fromRaw)) ? fromRaw : {};
+  const b = (toRaw && typeof toRaw === 'object' && !Array.isArray(toRaw)) ? toRaw : {};
+  const rowsA = toIntOr(Number(a.rows), 0), colsA = toIntOr(Number(a.cols), 0);
+  const rowsB = toIntOr(Number(b.rows), 0), colsB = toIntOr(Number(b.cols), 0);
+
+  const labels = [];
+  const affected = new Set();
+  const removed = new Set();
+  const la = labelMap(a.labels);
+  const lb = labelMap(b.labels);
+  const cells = [...new Set([...la.keys(), ...lb.keys()])]
+    .sort((c1, c2) => cellSortCompare(c1, c2));
+  for (const cell of cells) {
+    for (const face of ['front', 'back']) {
+      const va = la.has(cell) ? la.get(cell)[face] : null;
+      const vb = lb.has(cell) ? lb.get(cell)[face] : null;
+      if (va === vb) continue;
+      // 任一侧缺失且另一侧为空白面（''）都视为“无标注”，不报告差异
+      const kind = va == null ? (vb === '' ? null : 'add')
+        : vb == null ? (va === '' ? null : 'remove')
+        : va === '' || vb === '' ? (va === '' ? 'add' : 'remove') : 'modify';
+      if (!kind) continue;
+      labels.push({ kind, cell, face, from: va || '', to: vb || '' });
+      affected.add(cell);
+      if (!cellInGrid(cell, rowsB, colsB)) removed.add(cell);
+    }
+  }
+
+  const steps = [];
+  const sa = Array.isArray(a.steps) ? a.steps : [];
+  const sb = Array.isArray(b.steps) ? b.steps : [];
+  const stepCount = Math.max(sa.length, sb.length);
+  for (let i = 0; i < stepCount; i++) {
+    const sFrom = sanitizeStep(sa[i]);
+    const sTo = sanitizeStep(sb[i]);
+    let kind;
+    if (!sFrom && sTo) kind = 'add';
+    else if (sFrom && !sTo) kind = 'remove';
+    else if (stepKey(sFrom) !== stepKey(sTo)) kind = 'modify';
+    else continue;
+    const entry = {
+      kind, index: i,
+      from: sFrom ? { ...sFrom } : null,
+      to: sTo ? { ...sTo } : null,
+      fromCells: sFrom ? stepMoveOriginCells(a, sFrom, i) : [],
+      toCells: sTo ? stepMoveOriginCells(b, sTo, i) : []
+    };
+    if (sFrom && isValidStepShape(sFrom)) entry.fromText = describeStep(sFrom);
+    if (sTo && isValidStepShape(sTo)) entry.toText = describeStep(sTo);
+    steps.push(entry);
+    for (const c of entry.fromCells) { affected.add(c); if (!cellInGrid(c, rowsB, colsB)) removed.add(c); }
+    for (const c of entry.toCells) affected.add(c);
+  }
+
+  // 标签 / 备注 / 名称
+  const meta = [];
+  const nameA = typeof a.name === 'string' ? a.name : '';
+  const nameB = typeof b.name === 'string' ? b.name : '';
+  if (nameA !== nameB) meta.push({ kind: 'modify', field: 'name', from: nameA, to: nameB });
+  const noteA = typeof a.note === 'string' ? a.note : '';
+  const noteB = typeof b.note === 'string' ? b.note : '';
+  if (noteA !== noteB) meta.push({ kind: 'modify', field: 'note', from: noteA, to: noteB });
+  const tagsA = Array.isArray(a.tags) ? a.tags.filter((t) => typeof t === 'string') : [];
+  const tagsB = Array.isArray(b.tags) ? b.tags.filter((t) => typeof t === 'string') : [];
+  const setA = new Set(tagsA), setB = new Set(tagsB);
+  for (const t of tagsB) if (!setA.has(t)) meta.push({ kind: 'add', field: 'tag', value: t });
+  for (const t of tagsA) if (!setB.has(t)) meta.push({ kind: 'remove', field: 'tag', value: t });
+
+  // 校样批注（id 身份）
+  const annotations = [];
+  const annoA = new Map(), annoB = new Map();
+  (Array.isArray(a.annotations) ? a.annotations : []).forEach((x, i) => {
+    if (x && typeof x === 'object' && !Array.isArray(x)) annoA.set(typeof x.id === 'string' && x.id ? x.id : `@${i}`, x);
+  });
+  (Array.isArray(b.annotations) ? b.annotations : []).forEach((x, i) => {
+    if (x && typeof x === 'object' && !Array.isArray(x)) annoB.set(typeof x.id === 'string' && x.id ? x.id : `@${i}`, x);
+  });
+  const annoIds = [...new Set([...annoA.keys(), ...annoB.keys()])].sort();
+  const ANNO_FIELDS = ['cell', 'face', 'severity', 'text', 'step', 'resolved'];
+  for (const id of annoIds) {
+    const ra = annoA.get(id) || null, rb = annoB.get(id) || null;
+    let kind;
+    if (!ra && rb) kind = 'add';
+    else if (ra && !rb) kind = 'remove';
+    else {
+      const fields = ANNO_FIELDS
+        .filter((f) => annoFieldValue(ra, f) !== annoFieldValue(rb, f))
+        .map((f) => ({ field: f, from: annoFieldValue(ra, f), to: annoFieldValue(rb, f) }));
+      if (!fields.length) continue;
+      kind = 'modify';
+      annotations.push({
+        kind, id,
+        cell: rb.cell || ra.cell, face: rb.face || ra.face,
+        fields, from: { ...ra }, to: { ...rb }
+      });
+      if (ra.cell) { affected.add(ra.cell); if (!cellInGrid(ra.cell, rowsB, colsB)) removed.add(ra.cell); }
+      if (rb.cell) affected.add(rb.cell);
+      continue;
+    }
+    const rec = rb || ra;
+    annotations.push({ kind, id, cell: rec.cell || '', face: rec.face || '', fields: [], from: ra, to: rb });
+    if (ra && ra.cell) { affected.add(ra.cell); if (!cellInGrid(ra.cell, rowsB, colsB)) removed.add(ra.cell); }
+    if (rb && rb.cell) affected.add(rb.cell);
+  }
+
+  const countKinds = (list) => list.reduce((acc, e) => { acc[e.kind]++; return acc; },
+    { add: 0, remove: 0, modify: 0 });
+  const summary = {
+    labels: countKinds(labels),
+    steps: countKinds(steps),
+    annotations: countKinds(annotations),
+    meta: meta.length,
+    total: labels.length + steps.length + annotations.length + meta.length
+      + ((rowsA !== rowsB || colsA !== colsB) ? 1 : 0)
+  };
+
+  return {
+    ok: true,
+    grid: (rowsA !== rowsB || colsA !== colsB)
+      ? { from: { rows: rowsA, cols: colsA }, to: { rows: rowsB, cols: colsB } } : null,
+    meta, labels, steps, annotations,
+    affectedCells: [...affected].filter((c) => cellInGrid(c, rowsB, colsB))
+      .sort(cellSortCompare),
+    removedCells: [...removed].sort(cellSortCompare),
+    summary
+  };
+}
+
+function toIntOr(n, dflt) { return Number.isInteger(n) ? n : dflt; }
+
+function labelMap(raw) {
+  const map = new Map();
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    for (const [k, v] of Object.entries(raw)) {
+      if (!/^\d+,\d+$/.test(k) || !v || typeof v !== 'object') continue;
+      map.set(k, {
+        front: v.front != null ? String(v.front) : '',
+        back: v.back != null ? String(v.back) : ''
+      });
+    }
+  }
+  return map;
+}
+
+function parseCell(k) {
+  const m = /^(\d+),(\d+)$/.exec(k);
+  return m ? [Number(m[1]), Number(m[2])] : null;
+}
+
+function cellInGrid(k, rows, cols) {
+  const p = parseCell(k);
+  return !!p && Number.isInteger(rows) && Number.isInteger(cols) && rows > 0 && cols > 0
+    && p[0] >= 0 && p[0] < cols && p[1] >= 0 && p[1] < rows;
+}
+
+function cellSortCompare(c1, c2) {
+  const p1 = parseCell(c1), p2 = parseCell(c2);
+  if (!p1 || !p2) return c1 < c2 ? -1 : c1 > c2 ? 1 : 0;
+  return p1[1] - p2[1] || p1[0] - p2[0];
+}
+
+function isValidStepShape(s) {
+  return s && (s.axis === 'v' || s.axis === 'h')
+    && Number.isInteger(s.line) && ['l', 'r', 'u', 'd'].includes(s.dir);
+}
+
+function sanitizeStep(s) {
+  if (!s || typeof s !== 'object' || Array.isArray(s)) return null;
+  const axis = s.axis === 'v' || s.axis === 'h' ? s.axis : String(s.axis);
+  const line = Number(s.line);
+  const dir = String(s.dir);
+  return { axis, line, dir };
+}
+
+function stepKey(s) {
+  return s ? `${s.axis}|${s.line}|${s.dir}` : '';
+}
+
+function annoFieldValue(rec, field) {
+  if (!rec) return undefined;
+  if (field === 'resolved') return rec.resolved === true;
+  if (field === 'step') return Number(rec.step) || 0;
+  return rec[field] == null ? '' : String(rec[field]);
+}
+
+/**
+ * 某一步折叠在指定方案中会移动哪些<b>原始纸格</b>（差异画布高亮用）。
+ * 优先取该步前缀回放态中移动侧各叠面片的原始坐标；
+ * 前缀含非法步骤或网格非法时，退化为初始网格上按折线/方向取几何半区。
+ */
+function stepMoveOriginCells(plan, step, index) {
+  const rows = Number(plan.rows), cols = Number(plan.cols);
+  if (!Number.isInteger(rows) || rows < 1 || !Number.isInteger(cols) || cols < 1) return [];
+  const list = Array.isArray(plan.steps) ? plan.steps : [];
+  const upto = Math.max(0, Math.min(index, list.length));
+  const out = new Set();
+  const collectFromState = (state) => {
+    const movingSide = { r: 'l', l: 'r', d: 'u', u: 'd' }[step.dir];
+    if (!movingSide) return;
+    for (const [cell, ids] of Object.entries(state.stacks)) {
+      const [cx, cy] = cell.split(',').map(Number);
+      const side = step.axis === 'v' ? (cx < step.line ? 'l' : 'r')
+                                    : (cy < step.line ? 'u' : 'd');
+      if (side !== movingSide) continue;
+      for (const id of ids) {
+        const p = state.panels[id];
+        if (p) out.add(key(p.ox, p.oy));
+      }
+    }
+  };
+  const r = replay(rows, cols, plan.labels || {}, list, upto);
+  collectFromState(r.state);
+  if (!out.size) {
+    // 几何兜底：初始网格上落在移动半区的纸格
+    const movingSide = { r: 'l', l: 'r', d: 'u', u: 'd' }[step.dir];
+    if (!movingSide) return [];
+    for (let y = 0; y < rows; y++) {
+      for (let x = 0; x < cols; x++) {
+        const side = step.axis === 'v' ? (x < step.line ? 'l' : 'r')
+                                      : (y < step.line ? 'u' : 'd');
+        if (side === movingSide) out.add(key(x, y));
+      }
+    }
+  }
+  return [...out].sort(cellSortCompare);
+}
+
 /** 方案校验/规整（载入 JSON 时使用） */
 function normalizePlan(plan) {
   const errors = [];
@@ -1629,7 +1883,8 @@ const api = {
   trackPanel, auditPlan,
   normalizePlanMeta, coercePlanMeta, MetaError, META_LIMITS,
   normalizeAnnotations, coerceAnnotations, annotationStats, locateAnnotations,
-  AnnotationError, ANNO_LIMITS, ANNO_SEVERITIES, newAnnotationId
+  AnnotationError, ANNO_LIMITS, ANNO_SEVERITIES, newAnnotationId,
+  diffPlans, stepMoveOriginCells
 };
 
 if (typeof module !== 'undefined' && module.exports) module.exports = api;

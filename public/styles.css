@@ -140,6 +140,7 @@ button.fold { flex: 1 1 40%; min-width: 110px; font-weight: 600; }
 .swatch.conflict { background: var(--conflict); border-color: var(--conflict-edge); }
 .swatch.track { background: #fff1de; border-color: #e8820c; }
 .swatch.anno { background: #ecfdf3; border-color: #0f9d76; }
+.swatch.diff { background: #f1ebff; border-color: #7c4ee0; }
 .badge { margin-left: auto; padding: 3px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; }
 .badge.ok { background: #e3f6ec; color: var(--ok); }
 .badge.err { background: var(--warn-bg); color: var(--danger); }
@@ -653,12 +654,111 @@ button.fold { flex: 1 1 40%; min-width: 110px; font-weight: 600; }
 }
 .face-anno-count.open { background: var(--anno-error-bg); color: var(--anno-error); }
 
+/* ---------- 版本差异审阅 ---------- */
+.review-overlay {
+  position: fixed; inset: 0;
+  background: var(--bg);
+  z-index: 40;
+  display: flex; flex-direction: column;
+}
+.review-overlay[hidden] { display: none; }
+.review-bar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 8px 16px;
+  background: #fff;
+  border-bottom: 1px solid var(--line);
+  box-shadow: var(--shadow);
+}
+.review-bar select { width: auto; min-width: 150px; }
+.review-select-label { flex-direction: row; align-items: center; gap: 6px; }
+.review-arrow { color: var(--muted); font-weight: 700; }
+.review-summary { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.review-body {
+  flex: 1; min-height: 0;
+  display: grid;
+  grid-template-columns: 380px minmax(0, 1fr);
+  gap: 12px;
+  padding: 12px 16px;
+}
+.review-diff-panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+  box-shadow: var(--shadow);
+  overflow: auto;
+  min-height: 0;
+}
+.review-main {
+  display: flex; flex-direction: column; gap: 8px;
+  min-width: 0; min-height: 0; overflow: auto;
+}
+.review-banner {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  background: #f1ebff;
+  border: 1px solid #c9b6f5;
+  color: #4c2d92;
+  border-radius: 10px;
+  padding: 8px 14px;
+  box-shadow: var(--shadow);
+}
+.review-banner[hidden] { display: none; }
+.review-banner-text { font-size: 13px; line-height: 1.6; }
+.review-banner-actions { display: flex; gap: 8px; flex-shrink: 0; }
+
+.review-diff-list { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.review-group-title {
+  font-size: 12px; font-weight: 700; color: #102a5c;
+  margin: 8px 0 2px; display: flex; align-items: center; gap: 6px;
+}
+.review-count-chip {
+  font-size: 10px; font-weight: 700; border-radius: 999px; padding: 0 7px;
+  background: #eef1f5; color: var(--muted); font-variant-numeric: tabular-nums;
+}
+.review-item {
+  text-align: left;
+  border: 1px solid var(--line);
+  border-left-width: 3px;
+  border-radius: 6px;
+  padding: 6px 9px;
+  background: #fff;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: normal;
+  width: 100%;
+}
+.review-item:hover { border-color: #7c4ee0; color: var(--ink); background: #faf8ff; }
+.review-item.active { border-color: #7c4ee0; background: #f1ebff; }
+.review-item.k-add { border-left-color: var(--ok); }
+.review-item.k-remove { border-left-color: var(--danger); }
+.review-item.k-modify { border-left-color: #c9810a; }
+.review-item-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-weight: 600; }
+.review-badge {
+  font-size: 10px; font-weight: 700; border-radius: 4px; padding: 1px 6px; color: #fff;
+}
+.review-badge.k-add { background: var(--ok); }
+.review-badge.k-remove { background: var(--danger); }
+.review-badge.k-modify { background: #c9810a; }
+.review-item-body { color: var(--ink); margin-top: 2px; word-break: break-word; }
+.review-item-body .old { color: var(--danger); text-decoration: line-through; }
+.review-item-body .new { color: var(--ok); font-weight: 600; }
+.review-item-body .blank { color: var(--muted); }
+.review-item-cells { font-size: 11px; color: var(--muted); margin-top: 2px; }
+.review-empty { font-size: 12px; color: var(--muted); padding: 12px 4px; }
+
+/* 画布上的差异高亮（紫色虚线）与选中项（实线加粗） */
+.diff-cell-ring {
+  position: absolute; pointer-events: none;
+  border: 2px dashed #7c4ee0;
+  border-radius: 8px;
+}
+
 /* ---------- 打印样式：隐藏全部编辑控件，两张印版各占一页 ---------- */
 @media print {
   @page { size: A4 landscape; margin: 8mm; }
 
   body { background: #fff; }
-  .topbar, .layout, .modal { display: none !important; }
+  .topbar, .layout, .modal, .review-overlay { display: none !important; }
 
   .duplex-overlay {
     position: static;

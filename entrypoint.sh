@@ -24,7 +24,15 @@ const annos = E.normalizeAnnotations(
 if (annos.length !== 1 || annos[0].text !== '批注自检') throw new Error('批注规范化自检失败');
 const loc = E.locateAnnotations(1, 2, {}, grid.steps, 1, annos);
 if (!loc.ok || loc.points[0].at !== '1,0') throw new Error('批注身份定位自检失败');
-console.log('[fold-proofing] 折叠引擎、标签与批注规范化自检通过');
+// 版本差异自检：以原始纸格/步骤序号为稳定身份的增删改
+const d = E.diffPlans(
+  { name: '旧', rows: 1, cols: 2, labels: { '0,0': { front: '4', back: '' } },
+    steps: [{ axis: 'v', line: 1, dir: 'r' }], tags: [], note: '', annotations: [] },
+  { name: '新', rows: 1, cols: 2, labels: { '0,0': { front: '9', back: '' } },
+    steps: [{ axis: 'v', line: 1, dir: 'r' }], tags: ['骑马钉'], note: '', annotations: [] });
+if (!d.ok || d.summary.labels.modify !== 1 || d.affectedCells[0] !== '0,0')
+  throw new Error('版本差异引擎自检失败');
+console.log('[fold-proofing] 折叠引擎、标签/批注规范化与版本差异自检通过');
 "
 
 echo "[fold-proofing] 启动 Web 服务，端口 ${PORT:-3000} ..."

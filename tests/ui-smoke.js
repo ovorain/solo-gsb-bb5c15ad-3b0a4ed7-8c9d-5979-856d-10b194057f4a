@@ -21,7 +21,8 @@ function makeEl(id) {
     dispatch(t, ev = {}) { (listeners[t] || []).forEach((fn) => fn(ev)); },
     click() {}, focus() {},
     __children: [],
-    appendChild(c) { el.__children.push(c); }, append(...cs) { el.__children.push(...cs); },
+    appendChild(c) { el.__children.push(c); if (el.options) el.options.push(c); },
+    append(...cs) { el.__children.push(...cs); },
     querySelector() { return makeEl('q'); },
     querySelectorAll() { return []; },
     removeAttribute() {}, setAttribute() {},
@@ -73,7 +74,12 @@ const ids = ['rowsInput', 'colsInput', 'createGridBtn', 'axisSelect', 'lineSelec
   'annotationCard', 'annoOpenOnly', 'annoSeverityFilter', 'annoFaceFilter',
   'annoStatus', 'annoList', 'annoEditor', 'annoEditorTarget', 'annoEditorMeta',
   'annoSeverity', 'annoStepText', 'annoText', 'annoCharHint', 'annoEditorMsg',
-  'annoDeleteBtn', 'annoCancelBtn', 'annoSaveBtn'];
+  'annoDeleteBtn', 'annoCancelBtn', 'annoSaveBtn',
+  'reviewVersionsBtn', 'reviewOverlay', 'reviewFromSel', 'reviewToSel',
+  'reviewSummary', 'reviewMsg', 'reviewDiffList', 'reviewBanner',
+  'reviewBannerText', 'reviewExitViewBtn', 'reviewRestoreBtn', 'reviewSwapBtn',
+  'reviewCloseBtn', 'restoreConfirm', 'restoreConfirmText', 'restoreConfirmWarn',
+  'restoreCancelBtn', 'restoreOkBtn'];
 const els = Object.fromEntries(ids.map((id) => [id, makeEl(id)]));
 els.rowsInput.value = '2';
 els.colsInput.value = '2';
@@ -92,16 +98,59 @@ const foldBtns = ['l', 'r', 'u', 'd'].map((dir) => {
 
 // 存档存储桩：记录 POST 载荷与列表筛选查询，供标签/筛选流程断言
 const planStore = new Map();
+const versionStore = new Map();   // id -> [{ version, snapshot }]
 const fetchCalls = [];
 function makeJsonResponse(obj, status = 200) {
   return { status, ok: status >= 200 && status < 300, json: async () => obj };
+}
+function saveSnapshot(id, body) {
+  const list = versionStore.get(id) || [];
+  const version = list.length + 1;
+  // 深拷贝：前端保存成功后会把响应里的数组/对象引用回填到工作区，
+  // 快照必须持有独立副本（等价于真实服务端 JSON 落盘 + 浏览器 resp.json()）。
+  const snapshot = { ...JSON.parse(JSON.stringify(body)), version, savedAt: '2026-09-23T00:00:00.000Z' };
+  list.push({ version, snapshot });
+  versionStore.set(id, list);
+  return { version, snapshot: JSON.parse(JSON.stringify(snapshot)) };
 }
 async function stubFetch(url, opts = {}) {
   fetchCalls.push({ url, method: opts.method || 'GET', body: opts.body ? JSON.parse(opts.body) : null });
   if (url === '/api/plans' && (opts.method || 'GET') === 'POST') {
     const body = JSON.parse(opts.body);
-    planStore.set(body.id || 'auto-' + planStore.size, body);
-    return makeJsonResponse({ ok: true, id: body.id || 'id1', plan: body });
+    const id = body.id || 'auto-' + planStore.size;
+    planStore.set(id, body);
+    const { version, snapshot } = saveSnapshot(id, body);
+    return makeJsonResponse({ ok: true, id, version, plan: snapshot });
+  }
+  // 版本差异审阅相关只读接口
+  let m = /^\/api\/plans\/([^/]+)\/versions\/diff$/.exec(url);
+  if (m && (opts.method || 'GET') === 'POST') {
+    const q = JSON.parse(opts.body);
+    const list = versionStore.get(m[1]) || [];
+    const ra = list.find((x) => x.version === q.from);
+    const rb = list.find((x) => x.version === q.to);
+    if (!ra || !rb) return makeJsonResponse({ ok: false, error: { message: '版本不存在' } }, 404);
+    return makeJsonResponse({ ok: true, id: m[1], from: q.from, to: q.to,
+      diff: FE.diffPlans(ra.snapshot, rb.snapshot) });
+  }
+  m = /^\/api\/plans\/([^/]+)\/versions\/(\d+)$/.exec(url);
+  if (m) {
+    const list = versionStore.get(m[1]) || [];
+    const hit = list.find((x) => x.version === Number(m[2]));
+    return hit ? makeJsonResponse({ ok: true, snapshot: hit.snapshot })
+      : makeJsonResponse({ ok: false, error: { message: '版本不存在' } }, 404);
+  }
+  m = /^\/api\/plans\/([^/]+)\/versions$/.exec(url);
+  if (m) {
+    const list = versionStore.get(m[1]) || [];
+    return makeJsonResponse({
+      ok: true, id: m[1], count: list.length,
+      items: list.map(({ version, snapshot: p }) => ({
+        version, savedAt: p.savedAt, name: p.name, rows: p.rows, cols: p.cols,
+        steps: p.steps.length, tags: p.tags || [], note: p.note || '',
+        annotations: (p.annotations || []).length, openAnnotations: 0, restoredFrom: p.restoredFrom || null
+      }))
+    });
   }
   if (url.startsWith('/api/plans') && (opts.method || 'GET') === 'GET') {
     const qIndex = url.indexOf('?');
@@ -919,6 +968,119 @@ els.saveBtn.dispatch('click');
   // 载入后标记按末态定位
   marks = ui.currentAnnotationMarks(ui.replay.state);
   assert.deepEqual([...marks.keys()], ['1,1']);
+
+  // ---------- 版本差异审阅 ----------
+  // 准备一个已保存三次的服务器存档（桩 fetch 会为每次 POST 生成递增快照）
+  els.rowsInput.value = '1'; els.colsInput.value = '2';
+  els.createGridBtn.dispatch('click');
+  assert.equal(els.reviewVersionsBtn.disabled, true, '新建网格后审阅入口禁用');
+
+  // 以固定 id 走三版保存
+  ui.applyPlan({
+    name: '审阅方案', rows: 1, cols: 2,
+    labels: {}, steps: [{ axis: 'v', line: 1, dir: 'r' }]
+  }, 'review-plan');
+  assert.equal(els.reviewVersionsBtn.disabled, false, '载入服务器存档后审阅入口可用');
+  els.saveBtn.dispatch('click');
+  await new Promise((r) => setTimeout(r, 0));
+  // v2：追加页码 + 标签
+  ui.plan.labels = { '1,0': { front: '2', back: '3' } };
+  ui.addTag('骑马钉');
+  els.saveBtn.dispatch('click');
+  await new Promise((r) => setTimeout(r, 0));
+  // v3：批注
+  ui.openAnnotationEditor('0,0', 'front');
+  els.annoSeverity.value = 'error';
+  els.annoText.value = '封面问题';
+  els.annoSaveBtn.dispatch('click');
+  assert.equal(ui.plan.annotations.length, 1);
+  els.saveBtn.dispatch('click');
+  await new Promise((r) => setTimeout(r, 0));
+
+  // 打开审阅：拉取版本列表并默认比较倒数第二版 -> 最新版
+  await ui.openReview();
+  assert.equal(els.reviewOverlay.hidden, false);
+  assert.equal(ui.review.versions.length, 3);
+  assert.ok(ui.review.diff, '默认两版本应自动计算差异');
+  assert.ok(ui.review.diff.summary.total > 0);
+  // v2 -> v3 的差异含新增批注；高亮纸格至少包含批注原格 0,0
+  assert.ok(ui.review.diff.annotations.some((e) => e.kind === 'add' && e.cell === '0,0'));
+  assert.ok(ui.review.highlightCells.includes('0,0'));
+
+  // 显式比较 v1 -> v2：页码新增 + 标签新增
+  els.reviewFromSel.value = '1';
+  els.reviewToSel.value = '2';
+  ui.onReviewSelectChange();
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(ui.review.fromV, 1);
+  assert.equal(ui.review.toV, 2);
+  assert.ok(ui.review.diff.labels.some((e) => e.cell === '1,0' && e.face === 'front' && e.kind === 'add'));
+  assert.ok(ui.review.diff.meta.some((e) => e.field === 'tag' && e.kind === 'add'));
+  // 画布差异定位映射：1,0 在末态（竖折后）当前格位为 1,0
+  const diffMap = ui.currentDiffCellMap(ui.replay.state);
+  assert.ok(diffMap.has('1,0') || diffMap.size > 0);
+
+  // 点击页码差异项：进入 v2 只读查看，回放到末步、高亮具体纸格
+  const labelEntry = ui.review.diff.labels.find((e) => e.cell === '1,0' && e.face === 'front');
+  await ui.focusReviewEntry({ section: 'labels', kind: 'add', entry: labelEntry, cells: ['1,0'] });
+  assert.equal(ui.isReviewing(), true);
+  assert.equal(ui.review.view.version, 2, '新增类差异查看新版本 B=v2');
+  assert.equal(ui.review.highlightCell, '1,0');
+  assert.equal(ui.upto, 1);
+  assert.ok(els.reviewBanner.hidden === false);
+
+  // 只读守卫：查看历史版本时不能编辑（折叠/标签/批注/保存/建网格均被拦）
+  assert.equal(ui.requestStep({ axis: 'h', line: 1, dir: 'd'}), undefined);
+  assert.equal(ui.plan.steps.length, 1, '只读查看时不得追加步骤');
+  assert.equal(ui.addTag('试图改动'), false);
+  const stepsBefore = ui.plan.steps.length;
+  ui.setAnnotationResolved(ui.plan.annotations && ui.plan.annotations[0] && ui.plan.annotations[0].id, true);
+  assert.equal(ui.plan.steps.length, stepsBefore);
+
+  // 返回差异列表：草稿（含 v3 批注）恢复，未被只读视图污染
+  ui.exitVersionView();
+  assert.equal(ui.isReviewing(), false);
+  assert.equal(ui.plan.annotations.length, 1, '草稿批注应恢复');
+
+  // 删除类差异点击：只读查看旧版本 A=v1（无页码）
+  await ui.focusReviewEntry({
+    section: 'labels', kind: 'remove',
+    entry: { cell: '1,0', face: 'front' }, cells: ['1,0']
+  });
+  assert.equal(ui.review.view.version, 1);
+  assert.equal(Object.keys(ui.plan.labels).length, 0, 'v1 无页码标注');
+
+  // 恢复 v1 为当前草稿（确认弹层）
+  ui.askRestoreVersion();
+  assert.equal(els.restoreConfirm.hidden, false);
+  assert.ok(/v1/.test(els.restoreConfirmText.textContent));
+  ui.confirmRestoreVersion();
+  assert.equal(els.restoreConfirm.hidden, true);
+  assert.equal(ui.isReviewing(), false);
+  assert.equal(ui.loadedId, 'review-plan', '恢复沿用同一存档 id，延续版本谱系');
+  assert.equal(ui.restoredFrom, 1, '记录恢复来源，下次保存透传');
+  assert.deepEqual(ui.plan.tags, [], '草稿内容为 v1');
+  assert.equal(ui.plan.annotations.length, 0);
+
+  // 恢复后继续沿用既有保存流程：生成新版本且不覆盖历史（桩中 restoredFrom 透传）
+  els.saveBtn.dispatch('click');
+  await new Promise((r) => setTimeout(r, 0));
+  const restoreCall = fetchCalls[fetchCalls.length - 1];
+  assert.equal(restoreCall.method, 'POST');
+  assert.equal(restoreCall.body.restoredFrom, 1);
+  assert.equal(ui.restoredFrom, null, '落盘后恢复来源只保留在版本元信息上');
+
+  // 再次打开审阅：历史版本数量增加，旧版本仍可访问
+  await ui.openReview();
+  assert.ok(ui.review.versions.length >= 4);
+  const v1 = ui.review.versions.find((v) => v.version === 1);
+  assert.ok(v1, '历史 v1 未被覆盖');
+  ui.closeReview();
+  assert.equal(els.reviewOverlay.hidden, true);
+  assert.equal(ui.review.open, false);
+
+  // 引擎差异函数在未打开审阅时不产生画布高亮
+  assert.equal(ui.currentDiffCellMap(ui.replay.state).size, 0);
 
   console.log('前端冒烟流程全部通过');
 })();

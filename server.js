@@ -7,6 +7,8 @@
  *  - /api/creep-compensation：书帖爬移补偿逐叶偏移（只读计算）
  *  - /api/annotations/locate：校样批注按原始面片身份定位到指定回放步（只读）
  *  - /api/plans* ：方案 JSON 持久化到 DATA_DIR（容器卷，含标签/备注/校样批注）
+ *    每次成功保存在 DATA_DIR/<id>.versions/ 追加不可变版本快照，
+ *    支持 GET 版本列表/快照与 POST 两版本差异比较（diffPlans 与浏览器共用）
  */
 const express = require('express');
 const fs = require('fs');
@@ -244,6 +246,74 @@ app.post('/api/annotations/locate', (req, res) => {
   }
 });
 
+// ---------- 版本快照（不可变历史） ----------
+/**
+ * 每次成功保存都在 DATA_DIR/<id>.versions/ 下追加一个只写一次的快照文件，
+ * 快照内容即当时的完整方案 JSON（外加 version/savedAt 元字段）。
+ * 命名 `<6 位序号>-<短哈希>.json`：序号单调递增、全局唯一，写入用
+ * 临时文件 + rename；快照文件此后只读，不再被任何接口改写或删除
+ * （删除整个存档时才随目录一起移除）。
+ */
+function versionsDir(id) { return path.join(DATA_DIR, `${id}.versions`); }
+function versionFile(id, version) {
+  return path.join(versionsDir(id), `${String(version).padStart(6, '0')}.json`);
+}
+const VERSION_FILE_RE = /^(\d{6})\.json$/;
+const VERSION_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
+
+/** 计算下一个版本序号（扫描现存快照，取最大 +1；无快照为 1）。 */
+function nextVersionNumber(dir) {
+  if (!fs.existsSync(dir)) return 1;
+  let max = 0;
+  for (const f of fs.readdirSync(dir)) {
+    const m = VERSION_FILE_RE.exec(f);
+    if (m) max = Math.max(max, Number(m[1]));
+  }
+  return max + 1;
+}
+
+/** 版本摘要（用于版本列表；损坏文件跳过）。 */
+function versionSummary(id, f) {
+  const m = VERSION_FILE_RE.exec(f);
+  const version = m ? Number(m[1]) : null;
+  try {
+    const p = JSON.parse(fs.readFileSync(path.join(versionsDir(id), f), 'utf8'));
+    const annos = Array.isArray(p.annotations) ? p.annotations : [];
+    return {
+      version,
+      savedAt: typeof p.savedAt === 'string' ? p.savedAt
+        : typeof p.updatedAt === 'string' ? p.updatedAt : null,
+      name: p.name || '未命名方案',
+      rows: p.rows, cols: p.cols,
+      steps: Array.isArray(p.steps) ? p.steps.length : 0,
+      tags: Array.isArray(p.tags) ? p.tags : [],
+      note: typeof p.note === 'string' ? p.note : '',
+      annotations: annos.length,
+      openAnnotations: annos.reduce((n, a) => n + (a && a.resolved !== true ? 1 : 0), 0),
+      restoredFrom: p.restoredFrom || null
+    };
+  } catch { return null; }
+}
+
+/** 列出某存档的全部版本摘要（按序号升序）。 */
+function readVersions(id) {
+  const dir = versionsDir(id);
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir)
+    .filter((f) => VERSION_FILE_RE.test(f))
+    .sort()
+    .map((f) => versionSummary(id, f))
+    .filter(Boolean);
+}
+
+/** 原子写文件（非目标名临时文件 + rename）。 */
+function atomicWrite(filePath, content) {
+  const tmp = path.join(path.dirname(filePath),
+    `.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+  fs.writeFileSync(tmp, content);
+  fs.renameSync(tmp, filePath);
+}
+
 // ---------- 方案持久化 ----------
 function planFile(id) { return path.join(DATA_DIR, `${id}.json`); }
 
@@ -330,6 +400,7 @@ function readAllPlans() {
           steps: Array.isArray(p.steps) ? p.steps.length : 0,
           tags: Array.isArray(p.tags) ? p.tags : [],
           note: typeof p.note === 'string' ? p.note : '',
+          version: Number.isInteger(p.version) ? p.version : null,
           annotations: annos.length,
           openAnnotations: annos.reduce((n, a) => n + (a && a.resolved !== true ? 1 : 0), 0),
           createdAt: typeof p.createdAt === 'string' ? p.createdAt : updatedAt,
@@ -393,7 +464,7 @@ app.get('/api/plans', (req, res) => {
 });
 
 app.post('/api/plans', (req, res) => {
-  // 先完成全部校验，再触碰文件系统：非法请求绝不改动任何已有存档
+  // 先完成全部校验，再触碰文件系统：非法请求绝不改动任何已有存档与历史
   let plan, meta, annotations;
   try {
     plan = E.normalizePlan(req.body || {});
@@ -413,49 +484,146 @@ app.post('/api/plans', (req, res) => {
     return res.status(400).json({ ok: false, error: { code: e.code, message: e.message } });
   }
 
-  const id = (req.body && typeof req.body.id === 'string' && /^[a-zA-Z0-9_-]{1,64}$/.test(req.body.id))
+  const id = (req.body && typeof req.body.id === 'string' && VERSION_ID_RE.test(req.body.id))
     ? req.body.id : crypto.randomBytes(6).toString('hex');
   const now = new Date().toISOString();
   const existingPath = planFile(id);
+  const dir = versionsDir(id);
   let createdAt = now;
+  let oldHead = null;
   if (fs.existsSync(existingPath)) {
     try {
-      const old = JSON.parse(fs.readFileSync(existingPath, 'utf8'));
-      if (typeof old.createdAt === 'string') createdAt = old.createdAt;
-    } catch { /* 损坏旧档：以新时间为准 */ }
+      oldHead = JSON.parse(fs.readFileSync(existingPath, 'utf8'));
+      if (typeof oldHead.createdAt === 'string') createdAt = oldHead.createdAt;
+    } catch { /* 损坏旧档：以新时间为准，不把损坏内容写入历史 */ }
   }
 
-  const body = {
+  // 恢复操作由客户端完成（载入历史快照内容后作为新草稿保存）；
+  // restoredFrom 透传记录本次保存派生自哪个历史版本，仅作元信息，不影响校验。
+  const restoredFrom = req.body && typeof req.body.restoredFrom === 'number'
+    && Number.isInteger(req.body.restoredFrom) && req.body.restoredFrom >= 1
+    ? req.body.restoredFrom : null;
+
+  let body = {
     name: meta.name, rows: plan.rows, cols: plan.cols,
     labels: plan.labels, steps: plan.steps,
     tags: meta.tags, note: meta.note,
     annotations,
+    version: null,
+    restoredFrom,
     createdAt, updatedAt: now,
     savedAt: now
   };
   // 爬移补偿独立方案字段：存在则随存档保留（GET /api/plans/:id 原样返回）
   if (plan.creepCompensation) body.creepCompensation = plan.creepCompensation;
 
-  // 原子写入：先写临时文件（非 .json 名，不会被列表扫描读到）再 rename，失败不会留下半截存档
-  const tmp = path.join(DATA_DIR, `.${id}.json.tmp-${process.pid}-${Date.now()}`);
-  fs.writeFileSync(tmp, JSON.stringify(body, null, 2));
-  fs.renameSync(tmp, existingPath);
-  res.json({ ok: true, id, plan: body });
+  // 旧 head 此前未入历史（首次升级到版本功能）时先补存为 v1，
+  // 新方案从 v1 开始；版本号一旦落盘不可变。
+  // 全部写入均为“临时文件 + rename”：先追加历史快照，再替换 head，
+  // 失败不会留下半截存档或半截历史。
+  fs.mkdirSync(dir, { recursive: true });
+  if (oldHead && typeof oldHead.version !== 'number' && fs.readdirSync(dir).length === 0) {
+    atomicWrite(versionFile(id, 1), JSON.stringify({
+      ...oldHead,
+      version: 1,
+      savedAt: typeof oldHead.updatedAt === 'string' ? oldHead.updatedAt : now
+    }, null, 2));
+  }
+  // 新版本号在现存历史之后递增（含上面可能补存的 v1），保证序号单调、无空洞复用
+  body.version = nextVersionNumber(dir);
+  const serialized = JSON.stringify(body, null, 2);
+  atomicWrite(versionFile(id, body.version), serialized);
+  atomicWrite(existingPath, serialized);
+  res.json({ ok: true, id, version: body.version, plan: body });
 });
 
 app.get('/api/plans/:id', (req, res) => {
   const { id } = req.params;
-  if (!/^[a-zA-Z0-9_-]{1,64}$/.test(id)) return res.status(400).json({ ok: false, error: { message: '非法 id' } });
+  if (!VERSION_ID_RE.test(id)) return res.status(400).json({ ok: false, error: { message: '非法 id' } });
   const f = planFile(id);
   if (!fs.existsSync(f)) return res.status(404).json({ ok: false, error: { message: '方案不存在' } });
   res.type('application/json').send(fs.readFileSync(f, 'utf8'));
 });
 
+/**
+ * GET /api/plans/:id/versions：不可变版本摘要列表（按版本号升序）。
+ * 最新版本即当前 head；存档无任何版本（尚未保存过）时返回空数组。
+ */
+app.get('/api/plans/:id/versions', (req, res) => {
+  const { id } = req.params;
+  if (!VERSION_ID_RE.test(id)) {
+    return res.status(400).json({ ok: false, error: { code: 'bad_id', message: '非法 id' } });
+  }
+  if (!fs.existsSync(planFile(id))) {
+    return res.status(404).json({ ok: false, error: { code: 'not_found', message: '方案不存在' } });
+  }
+  const items = readVersions(id);
+  res.json({ ok: true, id, count: items.length, items });
+});
+
+/** 读取指定版本的完整快照；version 非法/越界/文件损坏给出明确错误码。 */
+function readVersionSnapshot(id, versionRaw) {
+  if (!VERSION_ID_RE.test(id)) return { error: { code: 'bad_id', message: '非法 id' }, status: 400 };
+  const version = Number(versionRaw);
+  if (!Number.isInteger(version) || version < 1) {
+    return { error: { code: 'bad_version', message: '版本号必须为不小于 1 的整数。' }, status: 400 };
+  }
+  if (!fs.existsSync(planFile(id))) {
+    return { error: { code: 'not_found', message: '方案不存在' }, status: 404 };
+  }
+  const f = versionFile(id, version);
+  if (!fs.existsSync(f)) {
+    return { error: { code: 'version_not_found', message: `版本 ${version} 不存在` }, status: 404 };
+  }
+  let snapshot;
+  try {
+    snapshot = JSON.parse(fs.readFileSync(f, 'utf8'));
+  } catch {
+    return { error: { code: 'version_corrupt', message: `版本 ${version} 快照损坏` }, status: 500 };
+  }
+  return { snapshot };
+}
+
+/** GET /api/plans/:id/versions/:version：返回单个不可变版本完整方案 JSON。 */
+app.get('/api/plans/:id/versions/:version', (req, res) => {
+  const result = readVersionSnapshot(req.params.id, req.params.version);
+  if (result.error) return res.status(result.status).json({ ok: false, error: result.error });
+  res.json({ ok: true, snapshot: result.snapshot });
+});
+
+/**
+ * POST /api/plans/:id/versions/diff：比较同一方案的两个不可变版本（只读）。
+ * body: { from:number, to:number }，差异计算与浏览器共用 foldEngine.diffPlans，
+ * 以原始纸格坐标与步骤序号为稳定身份。
+ */
+app.post('/api/plans/:id/versions/diff', (req, res) => {
+  const { id } = req.params;
+  if (!VERSION_ID_RE.test(id)) {
+    return res.status(400).json({ ok: false, error: { code: 'bad_id', message: '非法 id' } });
+  }
+  const fromV = req.body && Number(req.body.from);
+  const toV = req.body && Number(req.body.to);
+  if (!Number.isInteger(fromV) || !Number.isInteger(toV) || fromV < 1 || toV < 1) {
+    return res.status(400).json({
+      ok: false,
+      error: { code: 'bad_version', message: 'from / to 必须为不小于 1 的版本号整数。' }
+    });
+  }
+  const ra = readVersionSnapshot(id, fromV);
+  if (ra.error) return res.status(ra.status).json({ ok: false, error: ra.error });
+  const rb = readVersionSnapshot(id, toV);
+  if (rb.error) return res.status(rb.status).json({ ok: false, error: rb.error });
+  const diff = E.diffPlans(ra.snapshot, rb.snapshot);
+  res.json({ ok: true, id, from: fromV, to: toV, diff });
+});
+
 app.delete('/api/plans/:id', (req, res) => {
   const { id } = req.params;
-  if (!/^[a-zA-Z0-9_-]{1,64}$/.test(id)) return res.status(400).json({ ok: false, error: { message: '非法 id' } });
+  if (!VERSION_ID_RE.test(id)) return res.status(400).json({ ok: false, error: { message: '非法 id' } });
   const f = planFile(id);
   if (fs.existsSync(f)) fs.unlinkSync(f);
+  // 连带删除该存档的不可变版本历史（仅随整档删除，不提供单版本删除）
+  fs.rmSync(versionsDir(id), { recursive: true, force: true });
   res.json({ ok: true });
 });
 

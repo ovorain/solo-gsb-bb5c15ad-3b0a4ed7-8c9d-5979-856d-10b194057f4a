@@ -37,6 +37,15 @@
 > 随方案**保存 / 导出 / 导入**（保存严格校验整请求拒绝，导入宽容规整逐条丢弃坏数据），
 > 并可通过只读接口 `POST /api/annotations/locate` 脚本化定位。
 
+> **版本差异审阅**（新增）：每次“保存到服务器”都会在服务端生成一个**不可变版本
+> 快照**（仅追加、永不改写；删除存档才随档删除）。点“版本差异审阅…”可选择同一方案的
+> 任意两个版本，以**原始纸格坐标**与**步骤序号**为稳定身份，逐项对照
+> **正 / 反页码、折叠步骤、标签备注（元信息）、校样批注**的增 / 删 / 改，
+> 画布以**紫色虚线圈**高亮受影响纸格（折叠后按面片身份定位到当前叠）。
+> 点任一差异项即**只读查看对应版本并联动回放**（删除类看旧版、其余看新版）；
+> 可在确认后把任一历史版本**恢复为当前草稿**——恢复**不覆盖任何历史**，
+> 草稿沿用现有回放、审计与保存流程，再次保存即成为新版本（可选择恢复来源）。
+
 ---
 
 ## 一条命令启动
@@ -59,6 +68,8 @@ docker compose down
 > `npm install && npm start`，然后访问同一地址。
 
 方案 JSON 保存在容器内 `/app/data`（Compose 已声明命名卷 `fold-data`，删除容器不丢方案）。
+每个存档 `<id>.json` 旁边还有 `<id>.versions/` 目录，按保存顺序保存
+`000001.json`、`000002.json`… 不可变版本快照（删除存档时一起删除）。
 
 ---
 
@@ -187,7 +198,34 @@ docker compose down
       导入走宽容规整（坏条目逐条丢弃、级别非法降级为建议、正文超长截断）；
       “导出 JSON 报告”（审计）同样附带全部批注与批注统计；
     - 非法折叠回放截断时，批注仍按截断前最后合法状态定位，不会丢失或错位。
-13. **保存 / 载入**：
+13. **版本差异审阅**：存取卡片点“**版本差异审阅…**”（仅服务器存档可用；
+    未保存过的本地草稿先保存一次）：
+    - **版本来源**：每次“保存到服务器”都生成一个**不可变版本快照**
+      （服务端 `<数据卷>/<id>.versions/0000NN.json`，只写一次、永不改写；
+      删除整个存档才会连带删除历史），覆盖层顶部两个下拉默认选“倒数第二版 → 最新版”，
+      可任意改选或“⇄ 交换”，版本选项标明保存时间、步数与“恢复自 vN”来源；
+    - **差异身份与分组**：差异按两类稳定身份对齐——**原始纸格坐标**
+      （正反页码、批注归属）与**步骤序号**（第 N 步折叠）；结果分组为
+      **网格尺寸 / 元信息（名称、备注、标签）/ 正反页码 / 折叠步骤 / 校样批注**，
+      每条带 **新增（绿）/ 删除（红）/ 修改（橙）** 标记与旧值 → 新值；
+      批注差异细到 `cell / face / severity / text / step / resolved` 字段
+      （创建/解决时间等元数据不参与），顶部汇总各类增删改计数；
+    - **画布高亮**：受影响原始纸格在主画布用**紫色虚线圈**标出，折叠后仍按
+      面片身份定位到其当前所在叠（夹在层中时按层序偏移显示）；
+      仅比较两个版本、不进入只读查看时也能看到高亮（展示当前草稿/最新版画布）；
+    - **点击差异 → 联动回放**：点页码差异只读打开**新版**并定位到末步、高亮该纸格；
+      点折叠步差异定位到该步（新增类取该步之前、删除/修改类取该步之后），
+      圈出该步移动半区的原始纸格；点批注差异回到批注创建步并选中该纸格；
+      **删除类差异打开旧版本 A**（查看被删掉的内容），其余打开新版本 B；
+    - **只读查看**：历史版本打开后画布与右侧卡片完整可**回放 / 审计 / 寻路等只读分析**，
+      但所有编辑入口（页码、折叠、批注、标签、拼版写入、爬移应用、保存 / 删除）禁用；
+      点“返回差异列表”即恢复进入审阅前的草稿；
+    - **恢复为当前草稿**：点“恢复此版本为当前草稿”后**先确认**（若草稿有未保存修改
+      会额外警示），确认后把该版本完整内容复制为工作区草稿、退出只读查看；
+      **历史快照一个都不改动**，`loadedId` 沿用同一存档以延续版本谱系，
+      草稿继续使用现有回放 / 审计 / 保存流程，下次保存成为**新版本**
+      （元信息 `restoredFrom` 记录来源版本，列表中显示“恢复自 vN”）。
+14. **保存 / 载入**：
    - “保存到服务器”将方案 JSON 存入容器数据卷，可通过“已存方案…”再次载入；
    - “导出 JSON / 导入 JSON”在本地文件与应用之间交换方案；
    - **标签（0～8 个）**：在存取卡片的标签框输入后回车或点“添加”，每个标签
@@ -258,6 +296,10 @@ docker compose down
     导入时则宽容规整：坏条目丢弃、级别非法降级为 `info`、超长截断、越界 step 钳制。
 - `createdAt` / `updatedAt`：ISO 时间戳，更新方案时 `createdAt` 保留、
   `updatedAt` 刷新；缺少这些字段的旧存档在列表中以空标签/空备注、文件 mtime 兼容呈现。
+- `version`：服务端每次成功保存分配的**单调递增版本号**（≥1 整数），与
+  `<id>.versions/` 下的不可变快照一一对应；`restoredFrom`：该版本由哪个历史版本
+  “恢复为草稿”后保存而来（没有则为 `null`，仅作谱系元信息）。这两个字段由服务端管理，
+  客户端无需也无法指定版本号；导入 / 导出的普通方案 JSON 可不包含它们。
 
 应用过爬移补偿的方案还会带独立字段 `creepCompensation`（不应用则缺省）：
 
@@ -298,13 +340,13 @@ docker compose down
 ## 目录结构
 
 ```
-server.js              Express 服务：静态托管 + /api/simulate + /api/impose + /api/duplex-plate + /api/find-path + /api/trajectory + /api/audit + /api/creep-compensation + /api/annotations/locate + 方案持久化（标签/备注/校样批注/列表筛选）
-entrypoint.sh          容器启动入口（依赖自检/安装、引擎与批注规整自检、初始化、启动）
+server.js              Express 服务：静态托管 + /api/simulate + /api/impose + /api/duplex-plate + /api/find-path + /api/trajectory + /api/audit + /api/creep-compensation + /api/annotations/locate + 方案持久化（标签/备注/校样批注/列表筛选 + 不可变版本快照与 /versions 差异接口）
+entrypoint.sh          容器启动入口（依赖自检/安装、引擎/批注/版本差异自检、初始化、启动）
 public/
-  index.html           页面结构（含标签/备注编辑、存档筛选条与校样批注卡片/弹层）
-  styles.css           样式（含标签 chips、存档筛选、面片轨迹时间线、审计卡片、爬移补偿表、校样批注标记/列表与双面版打印样式 @media print）
-  foldEngine.js        折叠模拟引擎（浏览器与服务端共用，含面片轨迹 trackPanel、生产质量审计 auditPlan、书帖爬移补偿 creepCompensation、标签/备注规范化 normalizePlanMeta/coercePlanMeta、校样批注 normalizeAnnotations/coerceAnnotations/annotationStats/locateAnnotations）
-  app.js               Canvas 渲染、交互、回放、面片轨迹、存取（标签编辑/列表筛选）、双面印刷版预览、生产质量审计、书帖爬移补偿、校样批注（增删改/解决恢复/筛选/面片身份标记）
+  index.html           页面结构（含标签/备注编辑、存档筛选条、校样批注卡片/弹层与版本差异审阅覆盖层/恢复确认弹层）
+  styles.css           样式（含标签 chips、存档筛选、面片轨迹时间线、审计卡片、爬移补偿表、校样批注标记/列表、版本差异覆盖层与双面版打印样式 @media print）
+  foldEngine.js        折叠模拟引擎（浏览器与服务端共用，含面片轨迹 trackPanel、生产质量审计 auditPlan、书帖爬移补偿 creepCompensation、标签/备注规范化 normalizePlanMeta/coercePlanMeta、校样批注 normalizeAnnotations/coerceAnnotations/annotationStats/locateAnnotations、版本差异 diffPlans/stepMoveOriginCells）
+  app.js               Canvas 渲染、交互、回放、面片轨迹、存取（标签编辑/列表筛选）、双面印刷版预览、生产质量审计、书帖爬移补偿、校样批注（增删改/解决恢复/筛选/面片身份标记）、版本差异审阅（版本选择/差异列表/纸格高亮/只读查看联动回放/确认恢复为草稿）
 tests/engine.test.js   引擎单元测试（node --test）
 tests/meta.test.js     方案标签/备注/名称规范化（严格保存、宽容导入、码点计数）单元测试
 tests/annotations.test.js 校样批注（严格/宽容规整、错误码、统计、跨回放步与重排折叠的面片身份定位、非法步截断）单元测试
@@ -318,6 +360,8 @@ tests/trajectory.test.js 面片轨迹（身份追踪、层序/朝向、非法步
 tests/audit.test.js    生产质量审计（分级结论、空白/重复/倒置/未覆盖/容量、非法步中止）单元测试
 tests/creep.test.js    书帖爬移补偿（层序、书脊方向、标架换算、出血标红、字段规整）单元测试
 tests/tags.test.js     方案存档（标签规范化持久化、非法整请求 400 且不改旧档、标签交集/关键词/时间筛选、稳定排序与匹配计数、旧档兼容）HTTP 测试
+tests/versions.test.js 版本差异引擎 diffPlans（页码/步骤/批注/元信息增删改、稳定身份、受影响纸格、网格变化）单元测试
+tests/versions.http.test.js 不可变版本快照（单调版本号、列表/快照/diff 接口、非法请求不产生版本、恢复不覆盖历史、旧档升级补存 v1、删除连带清理）HTTP 测试
 tests/api.test.js      /api/impose、/api/find-path、/api/trajectory、/api/audit、/api/creep-compensation、/api/simulate 与方案存取的 HTTP 测试
 tests/ui-smoke.js      前端主流程冒烟（DOM 桩中加载 app.js，含标签编辑与筛选请求，直接 `node tests/ui-smoke.js` 运行）
 Dockerfile, docker-compose.yml
@@ -451,9 +495,10 @@ node tests/ui-smoke.js   # 前端主流程冒烟（DOM 桩，独立运行）
 | `too_many_annotations` | 批注超过 200 条 |
 | `bad_plan` | 几何字段（rows/cols/labels/steps）非法 |
 
-成功时返回 `{ ok:true, id, plan }`，`plan` 含规范化后的 `tags` / `note` 与
-`createdAt` / `updatedAt`（覆盖更新保留 `createdAt`、刷新 `updatedAt`）。
-写入采用临时文件 + rename 原子替换，非法请求不会留下半截文件。
+成功时返回 `{ ok:true, id, version, plan }`，`plan` 含规范化后的 `tags` / `note` 与
+`createdAt` / `updatedAt`（覆盖更新保留 `createdAt`、刷新 `updatedAt`），`version`
+为本次保存的新版本号；请求体可带 `restoredFrom:<版本号>` 记录恢复谱系。
+写入采用临时文件 + rename 原子替换，非法请求不会留下半截文件或半截版本历史。
 
 `GET /api/plans` 返回存档列表，查询参数：
 
@@ -482,6 +527,53 @@ node tests/ui-smoke.js   # 前端主流程冒烟（DOM 桩，独立运行）
 - 排序为 `updatedAt` 倒序，时间相同按 `id` 升序（稳定）；
 - `allTags` 为全部存档的标签聚合（不受筛选影响），按出现次数倒序、同次数按标签升序。
 
-`GET /api/plans/:id` 返回完整方案 JSON（含 `tags` / `note`）；
-`DELETE /api/plans/:id` 删除存档。缺少 `tags` / `note` / 时间戳的旧版存档可正常列出，
-首次保存更新时自动补齐。
+`GET /api/plans/:id` 返回完整方案 JSON（含 `tags` / `note`，已版本化的存档还含
+当前 `version`）；
+`DELETE /api/plans/:id` 删除存档**并连带删除其 `<id>.versions/` 全部历史快照**。
+缺少 `tags` / `note` / 时间戳的旧版存档可正常列出，首次保存更新时自动补齐，
+且升级前的 head 会被补存为版本 v1（再写入新 head 为 v2），历史不丢。
+
+### 版本差异接口（不可变快照）
+
+每次 `POST /api/plans` 成功后，服务端在 `DATA_DIR/<id>.versions/` 下以
+临时文件 + rename 追加一个 `0000NN.json` 快照（序号单调、只写一次），
+响应额外返回 `version`；非法请求在触碰文件系统前被拒绝，不会产生快照。
+
+`GET /api/plans/:id/versions` 返回版本摘要列表（按版本号升序）：
+
+```json
+{
+  "ok": true, "id": "ab12cd34ef56", "count": 3,
+  "items": [
+    { "version": 1, "savedAt": "…", "name": "8页折帖", "rows": 1, "cols": 2,
+      "steps": 1, "tags": [], "note": "",
+      "annotations": 0, "openAnnotations": 0, "restoredFrom": null }
+  ]
+}
+```
+
+`GET /api/plans/:id/versions/:version` 返回 `{ ok:true, snapshot }`，
+`snapshot` 即该版本完整方案 JSON（含当时的标签 / 备注 / 批注 / 爬移补偿字段）。
+版本号非法返回 `400 bad_version`，方案 / 版本不存在返回 `404 not_found` /
+`version_not_found`，快照损坏返回 `500 version_corrupt`。
+
+`POST /api/plans/:id/versions/diff`（body `{ "from": 1, "to": 3 }`）返回
+`{ ok, id, from, to, diff }`。`diff` 与浏览器共用同一份纯函数（`foldEngine.diffPlans`），
+以**原始纸格坐标**与**步骤序号**为稳定身份：
+
+- `grid`：`null` 或 `{ from:{rows,cols}, to:{rows,cols} }`；
+- `meta`：`[{ kind:'add'|'remove'|'modify', field:'name'|'note'|'tag', value?, from?, to? }]`；
+- `labels`：`[{ kind, cell, face:'front'|'back', from, to }]`（`''` 表示空白面，
+  从无标注变为空白面不报告）；
+- `steps`：`[{ kind, index, from:step|null, to:step|null, fromText?, toText?,
+  fromCells:[原始纸格], toCells:[原始纸格] }]`，`*Cells` 为该步实际移动的原始纸格
+  （前缀含非法步骤时按折线半区几何兜底）；
+- `annotations`：`[{ kind, id, cell, face, fields:[{field,from,to}], from, to }]`，
+  批注按 `id` 对齐，比较 `cell/face/severity/text/step/resolved` 六字段；
+- `affectedCells`：全部受影响、且落在**新版本网格内**可高亮的原始纸格（按行、列排序）；
+  `removedCells`：越出新版本网格、无法在新画布上高亮的旧纸格；
+- `summary`：`{ labels:{add,remove,modify}, steps:{…}, annotations:{…}, meta, total }`。
+
+恢复历史版本不需要专用写接口：客户端读取 `GET …/versions/:version` 的快照，
+经既有 `POST /api/plans`（带同一 `id`）保存即可——服务端分配**新**版本号、
+原历史全部保留；请求体可带 `restoredFrom:<历史版本号>` 记录恢复谱系。

@@ -79,6 +79,7 @@
         </div>
         <div class="row">
           <button id="loadListBtn">已存方案…</button>
+          <button id="reviewVersionsBtn" disabled>版本差异审阅…</button>
           <button id="deletePlanBtn" class="danger" hidden>删除当前存档</button>
         </div>
         <div id="planFilter" class="plan-filter" hidden>
@@ -118,6 +119,7 @@
           <span><i class="swatch conflict"></i>冲突纸格</span>
           <span><i class="swatch track"></i>追踪面片</span>
           <span><i class="swatch anno"></i>批注标记</span>
+          <span><i class="swatch diff"></i>差异纸格</span>
           <span id="statusBadge" class="badge"></span>
         </div>
       </div>
@@ -342,6 +344,53 @@
         </header>
         <div class="plate-sheet" id="plateBackSheet"></div>
       </section>
+    </div>
+  </div>
+
+  <!-- 版本差异审阅覆盖层 -->
+  <div id="reviewOverlay" class="review-overlay" hidden>
+    <div class="review-bar no-print">
+      <b>版本差异审阅</b>
+      <label class="review-select-label">版本 A（旧）
+        <select id="reviewFromSel"></select>
+      </label>
+      <span class="review-arrow">→</span>
+      <label class="review-select-label">版本 B（新）
+        <select id="reviewToSel"></select>
+      </label>
+      <span id="reviewSummary" class="review-summary"></span>
+      <span class="duplex-bar-spacer"></span>
+      <button id="reviewSwapBtn" title="交换 A / B">⇄ 交换</button>
+      <button id="reviewCloseBtn">关闭审阅</button>
+    </div>
+    <div class="review-body">
+      <aside class="review-diff-panel">
+        <div id="reviewMsg" class="hint"></div>
+        <div id="reviewDiffList" class="review-diff-list"></div>
+      </aside>
+      <section class="review-main">
+        <div id="reviewBanner" class="review-banner" hidden>
+          <div id="reviewBannerText" class="review-banner-text"></div>
+          <div class="review-banner-actions">
+            <button id="reviewExitViewBtn">返回差异列表</button>
+            <button id="reviewRestoreBtn" class="primary">恢复此版本为当前草稿</button>
+          </div>
+        </div>
+        <p class="hint" id="reviewHint">选择同一方案的两个版本后在此展示差异；点击任一差异项可只读查看对应版本并联动回放。</p>
+      </section>
+    </div>
+  </div>
+
+  <!-- 恢复历史版本确认弹层 -->
+  <div id="restoreConfirm" class="modal" hidden>
+    <div class="modal-body">
+      <h3>恢复历史版本</h3>
+      <div id="restoreConfirmText" class="hint"></div>
+      <div id="restoreConfirmWarn" class="error-box" hidden></div>
+      <div class="row right">
+        <button id="restoreCancelBtn">取消</button>
+        <button id="restoreOkBtn" class="primary">确认恢复</button>
+      </div>
     </div>
   </div>
 
